@@ -53,6 +53,7 @@ The project started from **nihui's** experimental ncnn `kvcache` work and expand
 | VLM | Qwen3.5 | Supported | Image + text input |
 | VLM | Qwen2.5-VL | Supported | Image + text input |
 | OCR | GLM-OCR | Supported | OCR |
+| TTS | Qwen2.5-TTS | Supported | Text-to-speech (codec / flow-matching) |
 | Translation | NLLB | Supported | Translation example |
 | Embedding | Jina-Embeddings-v5-Text-Nano | Supported | 768-dim text embeddings |
 | Embedding | Jina-CLIP-v2 | Supported | 1024-dim text + image embeddings |

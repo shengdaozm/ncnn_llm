@@ -92,6 +92,7 @@ CompileFlags:
 | `embedding_main` | 可执行程序 | 文本 embedding 示例 |
 | `clip_main` | 可执行程序 | CLIP 图文 embedding 示例 |
 | `ocr_main` | 可执行程序 | OCR 示例 |
+| `tts_main` | 可执行程序 | TTS 语音合成示例 |
 
 ## 运行示例
 
@@ -124,6 +125,31 @@ xmake run llm_ncnn_run --model ./assets/qwen2.5_vl_3b --image ./assets/test.jpg
 ```bash
 xmake build ocr_main
 xmake run ocr_main --model ./assets/glm_ocr --image ./test_ocr.png --prompt "Read the text in the image."
+```
+
+### TTS 语音合成
+
+```bash
+xmake build tts_main
+xmake run tts_main --model ./assets/qwen_tts --text "Hello, this is a text to speech test." --output ./tts_output.wav
+```
+
+启用 Vulkan 加速：
+
+```bash
+xmake run tts_main --model ./assets/qwen_tts --text "Hello world" --vulkan --vulkan-device 0
+```
+
+贪心解码（确定性输出）：
+
+```bash
+xmake run tts_main --model ./assets/qwen_tts --text "Hello world" --greedy
+```
+
+调整采样参数和最大生成长度：
+
+```bash
+xmake run tts_main --model ./assets/qwen_tts --text "Hello world" --temperature 0.5 --top-p 0.9 --top-k 100 --max-tokens 8192
 ```
 
 ### 文本 Embedding
@@ -173,6 +199,7 @@ xmake run benchllm [loop_count] [num_threads] [powersave] [gpu_device] [cooling_
 | VLM | Qwen3.5 | 图像 + 文本输入 |
 | VLM | Qwen2.5-VL | 图像 + 文本输入 |
 | OCR | GLM-OCR | 图片文字识别 |
+| TTS | Qwen2.5-TTS | 文本转语音（codec / flow-matching 双模式） |
 | 翻译 | NLLB | 翻译示例 |
 | Embedding | Jina-Embeddings-v5-Text-Nano | 768 维文本嵌入 |
 | Embedding | Jina-CLIP-v2 | 1024 维文本 + 图像嵌入 |
@@ -213,6 +240,25 @@ assets/
 | `--image` | VLM 输入图像路径 |
 | `--builtin-tools` | 启用内置演示工具 |
 
+`tts_main` 常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--model` | 模型目录 |
+| `--text` | 要合成的文本 |
+| `--output` | 输出 WAV 文件路径 |
+| `--threads` | CPU 线程数 |
+| `--vulkan` | 启用 Vulkan 计算 |
+| `--vulkan-device` | Vulkan 设备编号 |
+| `--max-tokens` | 最大生成 token 数 |
+| `--temperature` | 采样温度 |
+| `--top-p` | Top-p 采样 |
+| `--top-k` | Top-k 采样 |
+| `--repetition-penalty` | 重复惩罚 |
+| `--greedy` | 贪心解码（确定性） |
+| `--flow-steps` | Flow-matching ODE 步数 |
+| `--debug` | 调试输出 |
+
 ## 项目结构
 
 ```text
@@ -222,16 +268,23 @@ ncnn_llm/
 ├── examples/               # CLI 和功能示例
 │   ├── llm_ncnn_run/       # 统一聊天 / VLM 运行器
 │   ├── ocr_main.cpp        # OCR 示例
+│   ├── tts_main.cpp        # TTS 语音合成示例
 │   ├── embedding_main.cpp  # 文本嵌入示例
 │   ├── clip_main.cpp       # CLIP 示例
 │   └── nllb_main.cpp       # 翻译示例
 ├── export/                 # 导出脚本
+│   ├── nllb_export.py      # NLLB 导出
+│   └── qwen_tts_export.py  # Qwen2.5-TTS 导出
 ├── src/                    # 核心运行时
 │   ├── ncnn_llm_gpt.*      # LLM / VLM 运行时
 │   ├── ncnn_llm_ocr.*      # OCR 图像 prefill + 共享解码
+│   ├── ncnn_llm_tts.*      # TTS 语音合成运行时
 │   ├── ncnn_embedding.*    # 嵌入模型运行时
 │   ├── ncnn_text_runtime.* # 共享文本解码辅助函数
-│   └── utils/              # 分词器、图像、RoPE、prompt 工具
+│   ├── flow_matching.*     # Flow-matching ODE 求解器
+│   ├── sampling.*          # Token 采样逻辑
+│   └── utils/              # 分词器、图像、RoPE、prompt、音频工具
+│       └── audio/          # WAV 写入、音频 codec 解码
 ├── tests/                  # 单元测试
 └── xmake.lua               # 构建配置
 ```
