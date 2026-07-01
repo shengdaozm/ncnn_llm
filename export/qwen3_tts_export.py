@@ -102,17 +102,18 @@ class DecoderTS(nn.Module):
 class TokenizerDecoderTS(nn.Module):
     """Wrapper for Qwen3-TTS-Tokenizer-12Hz decoder.
     
-    The 12Hz tokenizer takes multi-codebook audio codes of shape (T, Q)
-    and decodes them to PCM waveform.
+    Wraps the internal decoder sub-module directly to avoid control flow
+    issues in model.decode() that break torch.jit.trace.
+    
+    Input: audio codes (batch, num_quantizers, T) e.g. (1, 16, 100)
+    Output: PCM waveform (batch, 1, samples)
     """
     def __init__(self, tokenizer_model: nn.Module):
         super().__init__()
-        self.model = tokenizer_model
+        self.decoder = tokenizer_model.decoder
 
-    def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
-        # audio_codes: (batch, T, Q) or (T, Q)
-        # Returns: PCM waveform
-        return self.model.decode(audio_codes)
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        return self.decoder(codes)
 
 
 def export_to_ncnn(module: nn.Module, example_inputs, out_dir: str, name: str,
@@ -144,8 +145,20 @@ def export_to_ncnn(module: nn.Module, example_inputs, out_dir: str, name: str,
                         module, example_inputs, onnx_path,
                         export_params=True, opset_version=17,
                         do_constant_folding=True,
+                        dynamo=True,
                     )
-                print(f"  Saved ONNX: {onnx_path}")
+                # Re-save without external data (inline all weights)
+                import onnx
+                from onnx.external_data_helper import convert_model_to_external_data
+                onnx_model = onnx.load(onnx_path, load_external_data=True)
+                for tensor in onnx_model.graph.initializer:
+                    tensor.ClearField('data_location')
+                onnx.save_model(onnx_model, onnx_path, save_as_external_data=False)
+                # Clean up external data file
+                ext_data = onnx_path + ".data"
+                if os.path.exists(ext_data):
+                    os.remove(ext_data)
+                print(f"  Saved ONNX (inline): {onnx_path}")
                 ts_path = onnx_path
             except Exception as e2:
                 print(f"  ONNX export also failed for {name}: {e2}")
@@ -246,9 +259,9 @@ def extract_tokenizer(tokenizer, out_dir: str):
 
 
 def build_model_json(config, tokenizer, out_dir: str,
-                     num_codebooks: int = 8,
+                     num_codebooks: int = 16,
                      sample_rate: int = 24000,
-                     codec_vocab_size: int = 32768,
+                     codec_vocab_size: int = 2048,
                      has_tokenizer_decoder: bool = False,
                      tts_model_type: str = "base"):
     model_json = {
@@ -436,19 +449,24 @@ def export_tokenizer_decoder(model_id: str, out_dir: str, device: Optional[str] 
     model = AutoModel.from_pretrained(model_id, dtype=torch.float32,
                                       trust_remote_code=True).to(device).eval()
 
-    # The tokenizer-12Hz decoder takes audio codes (T, Q) and returns PCM
-    # Q (num_quantizers) is typically 8 for 12Hz tokenizer
-    num_quantizers = getattr(config, 'num_quantizers', 8)
+    # Read actual config values
+    decoder_cfg = getattr(config, 'decoder_config', None)
+    if decoder_cfg is not None:
+        num_quantizers = getattr(decoder_cfg, 'num_quantizers', 16)
+        codebook_size = getattr(decoder_cfg, 'codebook_size', 2048)
+    else:
+        num_quantizers = 16
+        codebook_size = 2048
 
-    print(f"  num_quantizers: {num_quantizers}")
+    print(f"  num_quantizers: {num_quantizers}, codebook_size: {codebook_size}")
 
     # Try to access the decode method
     if hasattr(model, 'decode'):
         print("  Model has decode() method, wrapping for export...")
         tokenizer_ts = TokenizerDecoderTS(model)
 
-        # Example input: (1, T, Q) audio codes
-        ex_codes = torch.randint(0, 32768, (1, 100, num_quantizers), dtype=torch.long, device=device)
+        # Example input: (batch, num_quantizers, T) audio codes
+        ex_codes = torch.randint(0, codebook_size, (1, num_quantizers, 100), dtype=torch.long, device=device)
         try:
             export_to_ncnn(tokenizer_ts, ex_codes, out_dir, "tokenizer_decoder", device)
             return True
@@ -474,7 +492,7 @@ if __name__ == "__main__":
                         help="Device: cpu or cuda")
     parser.add_argument("--skip-tokenizer", action="store_true",
                         help="Skip exporting the tokenizer decoder")
-    parser.add_argument("--num_codebooks", type=int, default=8,
+    parser.add_argument("--num_codebooks", type=int, default=16,
                         help="Number of audio codebooks (quantizers)")
     parser.add_argument("--tts_model_type", type=str, default="base",
                         choices=["base", "custom_voice", "voice_design"],
