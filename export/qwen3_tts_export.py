@@ -201,13 +201,13 @@ def build_model_json(config, tokenizer, out_dir: str,
             "additional_special_tokens": tokenizer.additional_special_tokens if hasattr(tokenizer, 'additional_special_tokens') else [],
         },
         "setting": {
-            "attn_cnt": config.num_hidden_layers if hasattr(config, 'num_hidden_layers') else 28,
+            "attn_cnt": getattr(config, 'talker_config', config).num_hidden_layers if hasattr(getattr(config, 'talker_config', config), 'num_hidden_layers') else 28,
             "tts_mode": "codec",
             "tts_model_type": tts_model_type,
             "rope": {
                 "type": "RoPE",
-                "rope_head_dim": config.head_dim if hasattr(config, 'head_dim') else 128,
-                "rope_theta": config.rope_theta if hasattr(config, 'rope_theta') else 1000000.0,
+                "rope_head_dim": getattr(config, 'talker_config', config).head_dim if hasattr(getattr(config, 'talker_config', config), 'head_dim') else 128,
+                "rope_theta": getattr(config, 'talker_config', config).rope_theta if hasattr(getattr(config, 'talker_config', config), 'rope_theta') else 1000000.0,
             },
             "audio": {
                 "num_codebooks": num_codebooks,
@@ -269,26 +269,45 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     try:
-        model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32,
+        model = AutoModel.from_pretrained(model_id, dtype=torch.float32,
                                           trust_remote_code=True).to(device).eval()
     except Exception:
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32).to(device).eval()
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32,
+                                                     trust_remote_code=True).to(device).eval()
 
-    hidden_size = config.hidden_size if hasattr(config, 'hidden_size') else 1024
-    num_layers = config.num_hidden_layers if hasattr(config, 'num_hidden_layers') else 28
-    vocab_size = config.vocab_size if hasattr(config, 'vocab_size') else 151936
-    num_kv_heads = config.num_key_value_heads if hasattr(config, 'num_key_value_heads') else 4
-    num_heads = config.num_attention_heads if hasattr(config, 'num_attention_heads') else 16
-    head_dim = config.head_dim if hasattr(config, 'head_dim') else (hidden_size // num_heads)
+    # Qwen3-TTS model structure:
+    #   model.talker.model.text_embedding   → text token embedding
+    #   model.talker.model.layers           → decoder layers
+    #   model.talker.model.norm             → final norm
+    #   model.talker.codec_head             → output head (codec logits)
+    talker = getattr(model, 'talker', None)
+    talker_model = getattr(talker, 'model', None) if talker else None
+
+    if talker_model is not None:
+        print("  Detected Qwen3-TTS model structure (talker.model)")
+        embed = talker_model.text_embedding
+        lm_head = talker.codec_head
+        decoder_model = talker_model
+    else:
+        # Fallback: standard HF model structure
+        print("  Using standard model structure")
+        base_model = model.model if hasattr(model, 'model') else model
+        embed = base_model.embed_tokens if hasattr(base_model, 'embed_tokens') else model.embed_tokens
+        lm_head = model.lm_head if hasattr(model, 'lm_head') else base_model.lm_head
+        decoder_model = base_model if hasattr(base_model, 'layers') else model
+
+    # Get config parameters from talker config if available
+    talker_config = getattr(config, 'talker_config', config)
+    hidden_size = talker_config.hidden_size if hasattr(talker_config, 'hidden_size') else 1024
+    num_layers = talker_config.num_hidden_layers if hasattr(talker_config, 'num_hidden_layers') else 28
+    vocab_size = talker_config.vocab_size if hasattr(talker_config, 'vocab_size') else 151936
+    num_kv_heads = talker_config.num_key_value_heads if hasattr(talker_config, 'num_key_value_heads') else 4
+    num_heads = talker_config.num_attention_heads if hasattr(talker_config, 'num_attention_heads') else 16
+    head_dim = talker_config.head_dim if hasattr(talker_config, 'head_dim') else (hidden_size // num_heads)
 
     print(f"  hidden_size: {hidden_size}, num_layers: {num_layers}")
     print(f"  vocab_size: {vocab_size}, num_heads: {num_heads}, num_kv_heads: {num_kv_heads}, head_dim: {head_dim}")
-
-    # Get sub-modules
-    base_model = model.model if hasattr(model, 'model') else model
-    embed = base_model.embed_tokens if hasattr(base_model, 'embed_tokens') else model.embed_tokens
-    lm_head = model.lm_head if hasattr(model, 'lm_head') else base_model.lm_head
 
     # Export embedding
     print("\nExporting embed...")
@@ -358,7 +377,7 @@ def export_tokenizer_decoder(model_id: str, out_dir: str, device: Optional[str] 
         print("  WARNING: qwen_tts.core not found, relying on trust_remote_code")
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32,
+    model = AutoModel.from_pretrained(model_id, dtype=torch.float32,
                                       trust_remote_code=True).to(device).eval()
 
     # The tokenizer-12Hz decoder takes audio codes (T, Q) and returns PCM
