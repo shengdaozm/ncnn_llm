@@ -59,8 +59,7 @@ jobs:
     - name: Install Python Dependencies
       run: |
         pip install --upgrade pip
-        pip install torch transformers huggingface_hub soundfile librosa numpy
-        # Install pnnx (via ncnn)
+        pip install huggingface_hub[cli] torch transformers soundfile librosa numpy
         pip install pnnx || echo "pnnx pip install failed, will try CLI"
 
     - name: Cache HuggingFace Models
@@ -72,20 +71,22 @@ jobs:
 
     - name: Download Models
       env:
-        HF_HUB_ENABLE_HF_TRANSFER: 1
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        pip install hf_transfer
         mkdir -p ~/hf_models
 
+        # Login if token is provided (for gated models)
+        if [ -n "$HF_TOKEN" ]; then
+          hf auth login --token "$HF_TOKEN" || true
+        fi
+
         echo "=== Downloading LLM: $LLM_MODEL_ID ==="
-        huggingface-cli download "$LLM_MODEL_ID" \
-          --local-dir ~/hf_models/qwen3_tts_llm \
-          --local-dir-use-symlinks False || echo "LLM download failed (may be gated)"
+        hf download "$LLM_MODEL_ID" \
+          --local-dir ~/hf_models/qwen3_tts_llm || echo "LLM download failed (may be gated or need auth)"
 
         echo "=== Downloading Tokenizer: $TOKENIZER_MODEL_ID ==="
-        huggingface-cli download "$TOKENIZER_MODEL_ID" \
-          --local-dir ~/hf_models/qwen3_tts_tokenizer \
-          --local-dir-use-symlinks False || echo "Tokenizer download failed (may be gated)"
+        hf download "$TOKENIZER_MODEL_ID" \
+          --local-dir ~/hf_models/qwen3_tts_tokenizer || echo "Tokenizer download failed (may be gated or need auth)"
 
     - name: Verify Model Files
       run: |
