@@ -64,42 +64,39 @@ class LmHeadTS(nn.Module):
         return self.lm_head(hidden_states)
 
 
-class DecoderLayerTS(nn.Module):
-    def __init__(self, layer: nn.Module):
-        super().__init__()
-        self.layer = layer
-
-    def forward(self, hidden_states, cos_cache, sin_cache,
-                cache_k, cache_v):
-        out = self.layer(
-            hidden_states,
-            position_ids=None,
-            past_key_value=(cache_k, cache_v) if cache_k is not None else None,
-            use_cache=True,
-        )
-        return out[0], out[1][0], out[1][1]
-
-
 class DecoderTS(nn.Module):
-    def __init__(self, model: nn.Module, num_layers: int):
+    """Wrapper for the TalkerModel decoder.
+    
+    Qwen3-TTS talker model has complex control flow (position_ids.ndim checks)
+    that breaks torch.jit.trace. We bypass this by calling the internal
+    layers directly, which gives a clean traceable graph.
+    """
+    def __init__(self, model: nn.Module):
         super().__init__()
-        self.layers = nn.ModuleList([
-            DecoderLayerTS(model.layers[i]) for i in range(num_layers)
-        ])
-        self.norm = model.norm if hasattr(model, 'norm') else nn.Identity()
+        self.layers = model.layers
+        self.norm = model.norm
+        self.rotary_emb = model.rotary_emb
 
-    def forward(self, hidden_states, cos_cache, sin_cache, *caches):
-        new_ks = []
-        new_vs = []
-        x = hidden_states
-        for i, layer in enumerate(self.layers):
-            ck = caches[i * 2] if len(caches) > i * 2 else None
-            cv = caches[i * 2 + 1] if len(caches) > i * 2 + 1 else None
-            x, nk, nv = layer(x, cos_cache, sin_cache, ck, cv)
-            new_ks.append(nk)
-            new_vs.append(nv)
-        x = self.norm(x)
-        return x, new_ks, new_vs
+    def forward(self, inputs_embeds, position_ids):
+        # Compute position embeddings once
+        cos, sin = self.rotary_emb(inputs_embeds, position_ids)
+        position_embeddings = (cos, sin)
+
+        hidden = inputs_embeds
+        for layer in self.layers:
+            out = layer(
+                hidden_states=hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                cache_position=None,
+                position_embeddings=position_embeddings,
+            )
+            hidden = out[0]
+
+        hidden = self.norm(hidden)
+        return hidden
 
 
 class TokenizerDecoderTS(nn.Module):
@@ -124,54 +121,126 @@ def export_to_ncnn(module: nn.Module, example_inputs, out_dir: str, name: str,
 
     param_path = os.path.join(out_dir, f"{name}.ncnn.param")
     bin_path = os.path.join(out_dir, f"{name}.ncnn.bin")
+    ts_path = os.path.join(out_dir, f"{name}.pt")
 
     module = module.to(device).eval()
 
-    try:
-        import pnnx
-        pnnx.convert(module, example_inputs, outputdir=out_dir,
-                     optlevel=2, pnnx_param=param_path, pnnx_bin=bin_path,
-                     fp16=False)
-    except (ImportError, Exception) as e:
-        print(f"  pnnx convert failed for {name}: {e}")
-        print(f"  Falling back to TorchScript export: {name}.pt")
-        ts_path = os.path.join(out_dir, f"{name}.pt")
-        with torch.no_grad():
+    # Step 1: Export to TorchScript first
+    with torch.no_grad():
+        try:
             if isinstance(example_inputs, (list, tuple)):
                 traced = torch.jit.trace(module, example_inputs)
             else:
                 traced = torch.jit.trace(module, example_inputs)
-        traced.save(ts_path)
-        print(f"  Saved TorchScript: {ts_path}")
-        print(f"  Use pnnx CLI to convert: pnnx {ts_path}")
+            traced.save(ts_path)
+            print(f"  Saved TorchScript: {ts_path}")
+        except Exception as e:
+            print(f"  TorchScript trace failed for {name}: {e}")
+            # Try ONNX as alternative intermediate format
+            onnx_path = os.path.join(out_dir, f"{name}.onnx")
+            try:
+                with torch.no_grad():
+                    torch.onnx.export(
+                        module, example_inputs, onnx_path,
+                        export_params=True, opset_version=17,
+                        do_constant_folding=True,
+                    )
+                print(f"  Saved ONNX: {onnx_path}")
+                ts_path = onnx_path
+            except Exception as e2:
+                print(f"  ONNX export also failed for {name}: {e2}")
+                print(f"  WARNING: Could not export {name}")
+                return "", ""
 
-    return param_path, bin_path
+    # Step 2: Convert to ncnn via pnnx CLI
+    try:
+        import pnnx
+        # pnnx CLI: pnnx model.pt inputshape=[...] ncnnparam=... ncnnbin=...
+        shapes = []
+        for inp in (example_inputs if isinstance(example_inputs, (list, tuple)) else [example_inputs]):
+            if isinstance(inp, torch.Tensor):
+                shape_str = ",".join(str(s) for s in inp.shape)
+                dtype_str = "f32" if inp.dtype == torch.float32 else "i64" if inp.dtype == torch.long else "f32"
+                shapes.append(f"[{shape_str}]{dtype_str}")
+        inputshape_str = ",".join(shapes)
+
+        import subprocess
+        cmd = [
+            "pnnx", ts_path,
+            f"inputshape={inputshape_str}",
+            f"ncnnparam={param_path}",
+            f"ncnnbin={bin_path}",
+            "fp16=0",
+            "optlevel=2",
+            f"device={'gpu' if device != 'cpu' else 'cpu'}",
+        ]
+        print(f"  Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(param_path):
+            print(f"  Saved ncnn: {param_path}")
+            return param_path, bin_path
+        else:
+            print(f"  pnnx CLI failed (exit {result.returncode})")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:500]}")
+            if result.stdout:
+                print(f"  stdout: {result.stdout[:500]}")
+            print(f"  Use pnnx CLI manually: pnnx {ts_path}")
+            return ts_path, ""
+    except Exception as e:
+        print(f"  pnnx convert failed for {name}: {e}")
+        print(f"  Use pnnx CLI manually: pnnx {ts_path}")
+        return ts_path, ""
 
 
 def extract_tokenizer(tokenizer, out_dir: str):
+    # Copy vocab.json and merges.txt directly from the model directory
+    # (Qwen2 tokenizer stores them as files, not accessible via Python API)
+    import shutil
+
+    model_dir = getattr(tokenizer, '_tokenizer', None)
+    # Try to get the source directory from the tokenizer
+    vocab_json_src = None
+    merges_txt_src = None
+
+    # Search in known locations
+    for attr in ('name_or_path', '_name_or_path'):
+        path = getattr(tokenizer, attr, None)
+        if path and os.path.isdir(path):
+            vocab_json_src = os.path.join(path, 'vocab.json')
+            merges_txt_src = os.path.join(path, 'merges.txt')
+            break
+
     vocab_path = os.path.join(out_dir, "vocab.txt")
     merges_path = os.path.join(out_dir, "merges.txt")
 
-    vocab = tokenizer.get_vocab()
-    id_to_token = sorted(vocab.items(), key=lambda x: x[1])
-
-    with open(vocab_path, "w", encoding="utf-8") as f:
-        for token, _ in id_to_token:
-            f.write(token + "\n")
-
-    if hasattr(tokenizer, 'get_merges'):
-        merges = tokenizer.get_merges()
-    elif hasattr(tokenizer, 'merges'):
-        merges = tokenizer.merges
+    if vocab_json_src and os.path.exists(vocab_json_src):
+        # Convert vocab.json to vocab.txt (id-sorted token list)
+        import json
+        with open(vocab_json_src, 'r', encoding='utf-8') as f:
+            vocab = json.load(f)
+        id_to_token = sorted(vocab.items(), key=lambda x: x[1])
+        with open(vocab_path, 'w', encoding='utf-8') as f:
+            for token, _ in id_to_token:
+                f.write(token + '\n')
+        print(f"  Extracted vocab.txt ({len(id_to_token)} tokens)")
     else:
-        merges = []
+        # Fallback: use tokenizer API
+        vocab = tokenizer.get_vocab()
+        id_to_token = sorted(vocab.items(), key=lambda x: x[1])
+        with open(vocab_path, 'w', encoding='utf-8') as f:
+            for token, _ in id_to_token:
+                f.write(token + '\n')
+        print(f"  Extracted vocab.txt via API ({len(id_to_token)} tokens)")
 
-    with open(merges_path, "w", encoding="utf-8") as f:
-        for merge in merges:
-            if isinstance(merge, (list, tuple)):
-                f.write(" ".join(merge) + "\n")
-            else:
-                f.write(str(merge) + "\n")
+    if merges_txt_src and os.path.exists(merges_txt_src):
+        shutil.copy2(merges_txt_src, merges_path)
+        print(f"  Copied merges.txt")
+    else:
+        # Create empty merges file as fallback
+        with open(merges_path, 'w') as f:
+            pass
+        print(f"  WARNING: merges.txt not found, created empty file")
 
     return "vocab.txt", "merges.txt"
 
@@ -245,25 +314,13 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     # The qwen_tts package does NOT auto-register on import;
     # we must explicitly call AutoConfig.register / AutoModel.register.
     try:
-        from qwen_tts.core import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
+        from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-        print("  qwen3_tts model type registered via qwen_tts.core")
-    except ImportError:
-        print("  WARNING: qwen_tts.core not found, trying trust_remote_code fallback")
-        try:
-            import qwen_tts  # noqa: F401
-            from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
-            # Trigger registration by calling the class method that does it
-            # Qwen3TTSModel.from_pretrained registers, but we don't want to load yet
-            # Instead, manually register using the classes from the package
-            from qwen_tts.core.models import Qwen3TTSConfig as _Cfg, Qwen3TTSForConditionalGeneration as _Mdl
-            AutoConfig.register("qwen3_tts", _Cfg)
-            AutoModel.register(_Cfg, _Mdl)
-            print("  qwen3_tts model type registered via qwen_tts.core.models")
-        except Exception as e:
-            print(f"  WARNING: Could not register qwen3_tts: {e}")
-            print("  Will rely on trust_remote_code=True")
+        print("  qwen3_tts model type registered")
+    except ImportError as e:
+        print(f"  WARNING: Could not register qwen3_tts: {e}")
+        print("  Will rely on trust_remote_code=True")
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -327,20 +384,15 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
 
     # Export decoder
     print("\nExporting decoder (this may take a while)...")
-    decoder_model = base_model if hasattr(base_model, 'layers') else model
-    decoder_ts = DecoderTS(decoder_model, num_layers)
+    decoder_ts = DecoderTS(decoder_model)
 
     seq_len = 8
     ex_embed = torch.randn(1, seq_len, hidden_size, device=device)
-    ex_cos = torch.randn(seq_len, head_dim, device=device)
-    ex_sin = torch.randn(seq_len, head_dim, device=device)
-    caches = []
-    for _ in range(num_layers):
-        caches.append(torch.randn(1, num_kv_heads, 0, head_dim, device=device))
-        caches.append(torch.randn(1, num_kv_heads, 0, head_dim, device=device))
+    # Qwen3-TTS uses mRoPE with 3D position_ids: (3, bs, seq)
+    ex_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
 
     try:
-        export_to_ncnn(decoder_ts, [ex_embed, ex_cos, ex_sin] + caches,
+        export_to_ncnn(decoder_ts, [ex_embed, ex_position_ids],
                        out_dir, "decoder", device)
     except Exception as e:
         print(f"  Decoder export failed: {e}")
