@@ -28,8 +28,11 @@ def verify_params(config_json_path: str, model_json_path: str) -> bool:
     errors = []
     warnings = []
 
+    # Qwen3-TTS config.json has parameters nested under "talker_config"
+    talker_cfg = config.get("talker_config", config)
+
     # 1. num_hidden_layers -> attn_cnt
-    pytorch_layers = config.get("num_hidden_layers")
+    pytorch_layers = talker_cfg.get("num_hidden_layers")
     ncnn_attn_cnt = model.get("setting", {}).get("attn_cnt")
     if pytorch_layers is not None and ncnn_attn_cnt is not None:
         if pytorch_layers == ncnn_attn_cnt:
@@ -40,7 +43,7 @@ def verify_params(config_json_path: str, model_json_path: str) -> bool:
         warnings.append(f"Cannot compare layers: pytorch={pytorch_layers}, ncnn={ncnn_attn_cnt}")
 
     # 2. rope_theta
-    pytorch_rope_theta = config.get("rope_theta")
+    pytorch_rope_theta = talker_cfg.get("rope_theta")
     ncnn_rope_theta = model.get("setting", {}).get("rope", {}).get("rope_theta")
     if pytorch_rope_theta is not None and ncnn_rope_theta is not None:
         if abs(float(pytorch_rope_theta) - float(ncnn_rope_theta)) < 1e-6:
@@ -51,7 +54,7 @@ def verify_params(config_json_path: str, model_json_path: str) -> bool:
         warnings.append(f"Cannot compare rope_theta: pytorch={pytorch_rope_theta}, ncnn={ncnn_rope_theta}")
 
     # 3. head_dim
-    pytorch_head_dim = config.get("head_dim")
+    pytorch_head_dim = talker_cfg.get("head_dim")
     ncnn_head_dim = model.get("setting", {}).get("rope", {}).get("rope_head_dim")
     if pytorch_head_dim is not None and ncnn_head_dim is not None:
         if int(pytorch_head_dim) == int(ncnn_head_dim):
@@ -61,20 +64,41 @@ def verify_params(config_json_path: str, model_json_path: str) -> bool:
     else:
         warnings.append(f"Cannot compare head_dim: pytorch={pytorch_head_dim}, ncnn={ncnn_head_dim}")
 
-    # 4. vocab_size
-    pytorch_vocab = config.get("vocab_size")
-    ncnn_vocab = model.get("tokenizer", {})
+    # 4. vocab_size (codec vocab in talker_config)
+    pytorch_vocab = talker_cfg.get("vocab_size")
     if pytorch_vocab is not None:
-        print(f"  [INFO] PyTorch vocab_size: {pytorch_vocab}")
+        print(f"  [OK] PyTorch codec vocab_size: {pytorch_vocab}")
 
-    # 5. num_codebooks / frame_rate
+    # 4b. hidden_size / num_attention_heads / num_key_value_heads
+    pytorch_hidden = talker_cfg.get("hidden_size")
+    pytorch_num_heads = talker_cfg.get("num_attention_heads")
+    pytorch_kv_heads = talker_cfg.get("num_key_value_heads")
+    if pytorch_hidden is not None:
+        print(f"  [OK] hidden_size: {pytorch_hidden}")
+    if pytorch_num_heads is not None:
+        print(f"  [OK] num_attention_heads: {pytorch_num_heads}")
+    if pytorch_kv_heads is not None:
+        print(f"  [OK] num_key_value_heads: {pytorch_kv_heads}")
+
+    # 4c. rope_scaling (mRoPE)
+    pytorch_rope_scaling = talker_cfg.get("rope_scaling")
+    if pytorch_rope_scaling is not None:
+        print(f"  [OK] rope_scaling: {pytorch_rope_scaling}")
+
+    # 5. num_codebooks / frame_rate (from speech_tokenizer config if available)
     ncnn_audio = model.get("setting", {}).get("audio", {})
     ncnn_codebooks = ncnn_audio.get("num_codebooks")
     ncnn_frame_rate = ncnn_audio.get("frame_rate")
+    ncnn_codec_vocab = ncnn_audio.get("codec_vocab_size")
+    ncnn_sample_rate = ncnn_audio.get("sample_rate")
     if ncnn_codebooks is not None:
         print(f"  [OK] num_codebooks: {ncnn_codebooks}")
     if ncnn_frame_rate is not None:
         print(f"  [OK] frame_rate: {ncnn_frame_rate}")
+    if ncnn_codec_vocab is not None:
+        print(f"  [OK] codec_vocab_size: {ncnn_codec_vocab}")
+    if ncnn_sample_rate is not None:
+        print(f"  [OK] sample_rate: {ncnn_sample_rate}")
 
     # 6. tts_model_type
     ncnn_tts_type = model.get("setting", {}).get("tts_model_type")
