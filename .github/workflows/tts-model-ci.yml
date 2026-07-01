@@ -1,29 +1,6 @@
 name: tts-model-ci
 
 on:
-  push:
-    branches: [ main, ncnn_qwentts ]
-    paths:
-      - 'src/ncnn_llm_tts.*'
-      - 'src/flow_matching.*'
-      - 'src/utils/audio/**'
-      - 'examples/tts_main.cpp'
-      - 'tests/tts_load_test.cpp'
-      - 'tests/verify_tts_export.py'
-      - 'export/qwen3_tts_export.py'
-      - 'xmake.lua'
-      - '.github/workflows/tts-model-ci.yml'
-  pull_request:
-    paths:
-      - 'src/ncnn_llm_tts.*'
-      - 'src/flow_matching.*'
-      - 'src/utils/audio/**'
-      - 'examples/tts_main.cpp'
-      - 'tests/tts_load_test.cpp'
-      - 'tests/verify_tts_export.py'
-      - 'export/qwen3_tts_export.py'
-      - 'xmake.lua'
-      - '.github/workflows/tts-model-ci.yml'
   workflow_dispatch:
 
 env:
