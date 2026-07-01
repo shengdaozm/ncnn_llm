@@ -60,6 +60,8 @@ jobs:
       run: |
         pip install --upgrade pip
         pip install huggingface_hub[cli] torch transformers soundfile librosa numpy
+        # Install qwen-tts package to register qwen3_tts model type
+        pip install qwen-tts || echo "qwen-tts install failed"
         pip install pnnx || echo "pnnx pip install failed, will try CLI"
 
     - name: Cache HuggingFace Models

@@ -241,11 +241,21 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     print(f"Exporting LLM: {model_id}")
     print(f"{'='*60}")
 
-    config = AutoConfig.from_pretrained(model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Register qwen3_tts model type (requires qwen-tts package)
+    try:
+        import qwen_tts  # noqa: F401
+        print("  qwen_tts package imported, model types registered")
+    except ImportError:
+        print("  WARNING: qwen-tts package not found, trying manual registration")
+        # Fallback: try to register via transformers trust_remote_code
+        pass
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     try:
-        model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32).to(device).eval()
+        model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32,
+                                          trust_remote_code=True).to(device).eval()
     except Exception:
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32).to(device).eval()
@@ -318,8 +328,15 @@ def export_tokenizer_decoder(model_id: str, out_dir: str, device: Optional[str] 
 
     from transformers import AutoConfig, AutoModel
 
-    config = AutoConfig.from_pretrained(model_id)
-    model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32).to(device).eval()
+    # Register qwen3_tts_tokenizer model types
+    try:
+        import qwen_tts  # noqa: F401
+    except ImportError:
+        pass
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32,
+                                      trust_remote_code=True).to(device).eval()
 
     # The tokenizer-12Hz decoder takes audio codes (T, Q) and returns PCM
     # Q (num_quantizers) is typically 8 for 12Hz tokenizer

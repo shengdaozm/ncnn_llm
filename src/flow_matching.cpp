@@ -31,9 +31,6 @@ static ncnn::Mat run_flow_step(ncnn::Net& net,
 
     ncnn::Mat output;
     ncnn::Extractor ex = net.create_extractor();
-    if (num_threads > 0) {
-        ex.set_num_threads(num_threads);
-    }
     ex.input("in0", x);
     ex.input("in1", condition);
     ex.input("in2", x_mask);
@@ -166,9 +163,6 @@ ncnn::Mat vocoder_decode(ncnn::Net& vocoder_net,
     // Vocoder 前向：mel-spectrogram → 时域 PCM 波形
     ncnn::Mat output;
     ncnn::Extractor ex = vocoder_net.create_extractor();
-    if (num_threads > 0) {
-        ex.set_num_threads(num_threads);
-    }
     ex.input("in0", mel);
     ex.extract("out0", output);
     return output;
