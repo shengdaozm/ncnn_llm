@@ -5,7 +5,6 @@ on:
 
 env:
   LLM_MODEL_ID: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-  TOKENIZER_MODEL_ID: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
   MODEL_DIR: "assets/qwen3_tts"
 
 jobs:
@@ -42,9 +41,8 @@ jobs:
       run: |
         pip install --upgrade pip
         pip install huggingface_hub[cli] torch transformers soundfile librosa numpy
-        # Install qwen-tts package to register qwen3_tts model type
         pip install qwen-tts || echo "qwen-tts install failed"
-        pip install pnnx || echo "pnnx pip install failed, will try CLI"
+        pip install pnnx onnxscript onnx || echo "pnnx/onnx install failed"
 
     - name: Cache HuggingFace Models
       uses: actions/cache@v4
@@ -64,13 +62,9 @@ jobs:
           hf auth login --token "$HF_TOKEN" || true
         fi
 
-        echo "=== Downloading LLM: $LLM_MODEL_ID ==="
+        echo "=== Downloading LLM (includes speech_tokenizer): $LLM_MODEL_ID ==="
         hf download "$LLM_MODEL_ID" \
           --local-dir ~/hf_models/qwen3_tts_llm || echo "LLM download failed (may be gated or need auth)"
-
-        echo "=== Downloading Tokenizer: $TOKENIZER_MODEL_ID ==="
-        hf download "$TOKENIZER_MODEL_ID" \
-          --local-dir ~/hf_models/qwen3_tts_tokenizer || echo "Tokenizer download failed (may be gated or need auth)"
 
     - name: Verify Model Files
       run: |
@@ -78,8 +72,8 @@ jobs:
         ls -lh ~/hf_models/qwen3_tts_llm/ 2>/dev/null || echo "LLM model not downloaded"
 
         echo ""
-        echo "=== Tokenizer Model Files ==="
-        ls -lh ~/hf_models/qwen3_tts_tokenizer/ 2>/dev/null || echo "Tokenizer model not downloaded"
+        echo "=== Speech Tokenizer Files ==="
+        ls -lh ~/hf_models/qwen3_tts_llm/speech_tokenizer/ 2>/dev/null || echo "Speech tokenizer not found"
 
         echo ""
         echo "=== LLM config.json ==="
@@ -96,13 +90,13 @@ jobs:
           exit 0
         fi
 
-        echo "=== Exporting LLM to ncnn ==="
+        echo "=== Exporting LLM + Tokenizer-12Hz to ncnn ==="
         python export/qwen3_tts_export.py \
           --llm_model_id ~/hf_models/qwen3_tts_llm \
-          --tokenizer_model_id ~/hf_models/qwen3_tts_tokenizer \
+          --tokenizer_model_id ~/hf_models/qwen3_tts_llm/speech_tokenizer \
           --out_dir "$MODEL_DIR" \
           --device cpu \
-          --num_codebooks 8 \
+          --num_codebooks 16 \
           --tts_model_type base || {
             echo "Export script failed, but continuing for partial results"
           }
