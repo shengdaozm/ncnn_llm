@@ -136,3 +136,11 @@ target("tts_main")
     add_packages("ncnn", "nlohmann_json")
 
     set_rundir("$(projectdir)/")
+
+target("tts_load_test")
+    set_kind("binary")
+    add_files("tests/tts_load_test.cpp")
+    add_deps("ncnn_llm")
+    add_packages("ncnn", "nlohmann_json")
+
+    set_rundir("$(projectdir)/")

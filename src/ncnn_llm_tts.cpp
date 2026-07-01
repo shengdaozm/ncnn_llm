@@ -118,6 +118,11 @@ ncnn_llm_tts::ncnn_llm_tts(const std::string& model_path,
 
         vocab_size_ = (int)bpe_->vocab_size();
 
+        // 解析 TTS 模型类型
+        if (config["setting"].contains("tts_model_type")) {
+            tts_model_type_ = config["setting"]["tts_model_type"].get<std::string>();
+        }
+
         // 解析 TTS 模式：codec（离散 token 解码）或 flow（flow-matching + vocoder）
         std::string tts_mode_str = "codec";
         if (config["setting"].contains("tts_mode")) {
@@ -141,21 +146,40 @@ ncnn_llm_tts::ncnn_llm_tts(const std::string& model_path,
             if (audio_cfg.contains("sample_rate")) {
                 sample_rate_ = audio_cfg["sample_rate"].get<int>();
             }
+            if (audio_cfg.contains("frame_rate")) {
+                frame_rate_ = audio_cfg["frame_rate"].get<int>();
+            }
             if (audio_cfg.contains("mel_dim")) {
                 mel_dim_ = audio_cfg["mel_dim"].get<int>();
             }
         }
 
         // Codec 模式：加载音频 codec 解码网络
+        // 支持两种配置字段名：
+        //   - tokenizer_decoder_param/bin  (Qwen3-TTS-Tokenizer-12Hz)
+        //   - codec_param/bin              (旧版 SNAC/EnCodec)
         if (tts_mode_ == TTS_CODEC) {
-            if (config["params"].contains("codec_param")) {
+            if (config["params"].contains("tokenizer_decoder_param")) {
+                // Qwen3-TTS-Tokenizer-12Hz: 替换 AudioCodec 的配置键
+                json codec_config = config["params"];
+                codec_config["codec_param"] = config["params"]["tokenizer_decoder_param"];
+                codec_config["codec_bin"] = config["params"]["tokenizer_decoder_bin"];
+                audio_codec_ = std::make_unique<AudioCodec>(
+                    model_path, codec_config, use_vulkan, num_threads);
+                if (!audio_codec_->ok()) {
+                    fprintf(stderr, "[ncnn_llm_tts] Tokenizer decoder load failed\n");
+                    audio_codec_.reset();
+                } else {
+                    sample_rate_ = audio_codec_->sample_rate();
+                    num_codebooks_ = audio_codec_->num_codebooks();
+                }
+            } else if (config["params"].contains("codec_param")) {
                 audio_codec_ = std::make_unique<AudioCodec>(
                     model_path, config["params"], use_vulkan, num_threads);
                 if (!audio_codec_->ok()) {
                     fprintf(stderr, "[ncnn_llm_tts] Audio codec load failed\n");
                     audio_codec_.reset();
                 } else {
-                    // 用 codec 实际配置覆盖默认值
                     sample_rate_ = audio_codec_->sample_rate();
                     num_codebooks_ = audio_codec_->num_codebooks();
                 }
@@ -196,9 +220,9 @@ ncnn_llm_tts::ncnn_llm_tts(const std::string& model_path,
         }
 
         printf("  attn_cnt: %d, rope_head_dim: %d, rope_theta: %.1f\n", attn_cnt_, rope_head_dim_, rope_theta_);
-        printf("  tts_mode: %s, num_codebooks: %d, sample_rate: %d\n",
-               tts_mode_ == TTS_CODEC ? "codec" : "flow", num_codebooks_, sample_rate_);
-        printf("  vocab_size: %d, eos: %d\n", vocab_size_, eos_);
+        printf("  tts_mode: %s, num_codebooks: %d, sample_rate: %d, frame_rate: %d\n",
+               tts_mode_ == TTS_CODEC ? "codec" : "flow", num_codebooks_, sample_rate_, frame_rate_);
+        printf("  vocab_size: %d, eos: %d, model_type: %s\n", vocab_size_, eos_, tts_model_type_.c_str());
 
     } catch (std::exception& e) {
         ok_ = false;
@@ -245,10 +269,17 @@ ncnn::Mat ncnn_llm_tts::build_causal_mask(int seq_len) const {
  * @return 上下文，包含 KV cache、首 token、position_id
  */
 std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_tts::prefill(const std::string& text, const TtsConfig& cfg) {
-    std::vector<Message> messages;
-    messages.push_back(Message("user", text));
+    // Qwen3-TTS prompt format:
+    //   <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    // For CustomVoice/VoiceDesign, instruct is prepended as user message:
+    //   <|im_start|>user\n{instruct}<|im_end|>\n
+    std::string full_prompt;
 
-    std::string full_prompt = apply_chat_template(messages, {}, true, false);
+    if (!cfg.instruct.empty()) {
+        full_prompt += "<|im_start|>user\n" + cfg.instruct + "<|im_end|>\n";
+    }
+
+    full_prompt += "<|im_start|>assistant\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
 
     std::vector<int> token_ids = bpe_->encode(full_prompt, false, false);
 
@@ -346,12 +377,15 @@ std::vector<std::vector<int>> ncnn_llm_tts::generate_codec_tokens(
 
     printf("[ncnn_llm_tts] Generated %d codec tokens\n", (int)flat_tokens.size());
 
-    // 将 flat token 序列按 num_codebooks 交错拆分为多层 codebook
-    // 例如 num_codebooks=4 时：token[0]→cb0, token[1]→cb1, token[2]→cb2, token[3]→cb3, token[4]→cb0, ...
+    // Qwen3-TTS-12Hz: LLM 生成交错的多码本 token 序列
+    // 每 num_codebooks_ 个 token 构成一帧，对应 (T, Q) 矩阵的一行
+    // token[0]→(t=0,q=0), token[1]→(t=0,q=1), ..., token[Q-1]→(t=0,Q-1)
+    // token[Q]→(t=1,q=0), ...
+    int num_frames = (int)flat_tokens.size() / num_codebooks_;
     std::vector<std::vector<int>> codebook_tokens(num_codebooks_);
     for (int cb = 0; cb < num_codebooks_; ++cb) {
-        for (size_t i = cb; i < flat_tokens.size(); i += num_codebooks_) {
-            codebook_tokens[cb].push_back(flat_tokens[i]);
+        for (int t = 0; t < num_frames; ++t) {
+            codebook_tokens[cb].push_back(flat_tokens[t * num_codebooks_ + cb]);
         }
     }
 

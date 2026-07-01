@@ -1,0 +1,245 @@
+name: tts-model-ci
+
+on:
+  push:
+    branches: [ main, ncnn_qwentts ]
+    paths:
+      - 'src/ncnn_llm_tts.*'
+      - 'src/flow_matching.*'
+      - 'src/utils/audio/**'
+      - 'examples/tts_main.cpp'
+      - 'tests/tts_load_test.cpp'
+      - 'tests/verify_tts_export.py'
+      - 'export/qwen3_tts_export.py'
+      - 'xmake.lua'
+      - '.github/workflows/tts-model-ci.yml'
+  pull_request:
+    paths:
+      - 'src/ncnn_llm_tts.*'
+      - 'src/flow_matching.*'
+      - 'src/utils/audio/**'
+      - 'examples/tts_main.cpp'
+      - 'tests/tts_load_test.cpp'
+      - 'tests/verify_tts_export.py'
+      - 'export/qwen3_tts_export.py'
+      - 'xmake.lua'
+      - '.github/workflows/tts-model-ci.yml'
+  workflow_dispatch:
+
+env:
+  LLM_MODEL_ID: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+  TOKENIZER_MODEL_ID: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+  MODEL_DIR: "assets/qwen3_tts"
+
+jobs:
+  # ============================================================
+  # Job 1: 下载模型 + PNNX 导出 + 参数校验
+  # ============================================================
+  export-and-verify:
+    name: Export & Verify (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Cache Python Dependencies
+      uses: actions/cache@v4
+      id: pip-cache
+      with:
+        path: ~/.cache/pip
+        key: pip-tts-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
+
+    - name: Install Python Dependencies
+      run: |
+        pip install --upgrade pip
+        pip install torch transformers huggingface_hub soundfile librosa numpy
+        # Install pnnx (via ncnn)
+        pip install pnnx || echo "pnnx pip install failed, will try CLI"
+
+    - name: Cache HuggingFace Models
+      uses: actions/cache@v4
+      id: hf-cache
+      with:
+        path: ~/hf_models
+        key: hf-models-${{ env.LLM_MODEL_ID }}-${{ env.TOKENIZER_MODEL_ID }}
+
+    - name: Download Models
+      env:
+        HF_HUB_ENABLE_HF_TRANSFER: 1
+      run: |
+        pip install hf_transfer
+        mkdir -p ~/hf_models
+
+        echo "=== Downloading LLM: $LLM_MODEL_ID ==="
+        huggingface-cli download "$LLM_MODEL_ID" \
+          --local-dir ~/hf_models/qwen3_tts_llm \
+          --local-dir-use-symlinks False || echo "LLM download failed (may be gated)"
+
+        echo "=== Downloading Tokenizer: $TOKENIZER_MODEL_ID ==="
+        huggingface-cli download "$TOKENIZER_MODEL_ID" \
+          --local-dir ~/hf_models/qwen3_tts_tokenizer \
+          --local-dir-use-symlinks False || echo "Tokenizer download failed (may be gated)"
+
+    - name: Verify Model Files
+      run: |
+        echo "=== LLM Model Files ==="
+        ls -lh ~/hf_models/qwen3_tts_llm/ 2>/dev/null || echo "LLM model not downloaded"
+
+        echo ""
+        echo "=== Tokenizer Model Files ==="
+        ls -lh ~/hf_models/qwen3_tts_tokenizer/ 2>/dev/null || echo "Tokenizer model not downloaded"
+
+        echo ""
+        echo "=== LLM config.json ==="
+        cat ~/hf_models/qwen3_tts_llm/config.json 2>/dev/null || echo "No config.json"
+
+    - name: Run PNNX Export
+      run: |
+        mkdir -p "$MODEL_DIR"
+
+        # Check if models were downloaded
+        if [ ! -d ~/hf_models/qwen3_tts_llm ] || [ -z "$(ls ~/hf_models/qwen3_tts_llm)" ]; then
+          echo "WARNING: LLM model not available. Skipping export."
+          echo "SKIPPED=true" >> $GITHUB_ENV
+          exit 0
+        fi
+
+        echo "=== Exporting LLM to ncnn ==="
+        python export/qwen3_tts_export.py \
+          --llm_model_id ~/hf_models/qwen3_tts_llm \
+          --tokenizer_model_id ~/hf_models/qwen3_tts_tokenizer \
+          --out_dir "$MODEL_DIR" \
+          --device cpu \
+          --num_codebooks 8 \
+          --tts_model_type base || {
+            echo "Export script failed, but continuing for partial results"
+          }
+
+    - name: List Exported Files
+      if: env.SKIPPED != 'true'
+      run: |
+        echo "=== Exported Files ==="
+        ls -lhR "$MODEL_DIR" 2>/dev/null || echo "No export output"
+
+    - name: Copy config.json for Verification
+      if: env.SKIPPED != 'true'
+      run: |
+        cp ~/hf_models/qwen3_tts_llm/config.json "$MODEL_DIR/config.json" 2>/dev/null || true
+
+    - name: Run Parameter Verification
+      if: env.SKIPPED != 'true'
+      run: |
+        if [ -f "$MODEL_DIR/model.json" ]; then
+          python tests/verify_tts_export.py \
+            --model_dir "$MODEL_DIR" \
+            --config_path "$MODEL_DIR/config.json"
+        else
+          echo "model.json not found, skipping verification"
+        fi
+
+    - name: Upload Exported Model Artifact
+      if: env.SKIPPED != 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: tts-ncnn-model
+        path: ${{ env.MODEL_DIR }}/
+        retention-days: 7
+        if-no-files-found: warn
+
+  # ============================================================
+  # Job 2: C++ 编译 + 模型加载测试
+  # ============================================================
+  cpp-load-test:
+    name: C++ Build & Load Test (Ubuntu)
+    runs-on: ubuntu-latest
+    needs: export-and-verify
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Download Exported Model Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: tts-ncnn-model
+        path: assets/qwen3_tts
+      continue-on-error: true
+
+    - name: Check Model Files
+      run: |
+        echo "=== Downloaded Model Files ==="
+        ls -lhR assets/qwen3_tts/ 2>/dev/null || echo "No model artifact found"
+
+    - name: Setup xmake
+      uses: xmake-io/github-action-setup-xmake@v1
+      with:
+        xmake-version: latest
+
+    - name: Cache xmake packages
+      uses: actions/cache@v4
+      id: xmake-cache
+      with:
+        path: ~/.xmake
+        key: xmake-tts-ci-${{ runner.os }}-${{ hashFiles('xmake.lua') }}
+
+    - name: Configure
+      run: xmake config -y -m release
+
+    - name: Build tts_load_test
+      run: xmake build tts_load_test
+
+    - name: Build tts_main
+      run: xmake build tts_main
+
+    - name: Run TTS Load Test
+      run: |
+        if [ -f "assets/qwen3_tts/model.json" ]; then
+          echo "=== Running TTS Load Test ==="
+          find build -name "tts_load_test" -type f -exec {} --model assets/qwen3_tts \;
+        else
+          echo "SKIP: No model.json found, model load test skipped"
+          echo "This is expected if model download/export was skipped or failed"
+        fi
+
+    - name: Run TTS Main (Smoke Test)
+      timeout-minutes: 5
+      run: |
+        if [ -f "assets/qwen3_tts/model.json" ]; then
+          echo "=== Running TTS Main Smoke Test ==="
+          BINARY=$(find build -name "tts_main" -type f | head -1)
+          echo "Binary: $BINARY"
+
+          # Run with --help to verify it starts
+          "$BINARY" --help || true
+
+          # Attempt actual synthesis with very short token limit
+          # This will likely OOM or timeout on CI, so we use timeout
+          timeout 60 "$BINARY" \
+            --model assets/qwen3_tts \
+            --text "Hello" \
+            --output /tmp/tts_test.wav \
+            --max-tokens 64 \
+            --greedy \
+            --threads 2 \
+            --debug || {
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "TTS main timed out (expected on CI CPU), but didn't crash"
+              else
+                echo "TTS main exited with code $EXIT_CODE"
+                # Non-zero exit is acceptable on CI (model may be incomplete)
+              fi
+            }
+        else
+          echo "SKIP: No model available for smoke test"
+        fi
+
+

@@ -53,24 +53,30 @@ using nlohmann::json;
  * @brief TTS 合成配置
  */
 struct TtsConfig {
-    // --- LLM 自回归采样参数 ---
-    int max_new_tokens = 4096;       // 最大生成 token 数
-    float temperature = 0.3f;        // 采样温度
-    float top_p = 0.8f;              // Top-p 核采样阈值
+    // --- LLM 自回归采样参数 (对齐 Qwen3-TTS generate_config.json 默认值) ---
+    int max_new_tokens = 2048;       // 最大生成 token 数
+    float temperature = 0.9f;        // 采样温度
+    float top_p = 1.0f;              // Top-p 核采样阈值
     int top_k = 50;                  // Top-k 采样
-    float repetition_penalty = 1.1f; // 重复惩罚
+    float repetition_penalty = 1.05f;// 重复惩罚
     int do_sample = 1;               // 1 = 随机采样，0 = 贪心解码
     int num_threads = 4;             // CPU 线程数
 
-    // --- Flow-matching 参数（仅 TTS_FLOW 模式使用）---
+    // --- Flow-matching 参数（仅 TTS_FLOW 模式使用，Qwen3-TTS 默认 codec 模式不需要）---
     int flow_steps = 10;             // ODE 求解步数
     float flow_sigma = 0.0f;         // 初始噪声标准差
     int flow_ode_solver = 0;         // 0 = Euler, 1 = Heun
 
-    // --- 音色克隆（预留）---
+    // --- Qwen3-TTS 特有参数 ---
+    std::string language = "Auto";   // 语言: Auto/Chinese/English/...
+    std::string speaker;             // 说话人 (CustomVoice 模式)
+    std::string instruct;            // 指令文本 (VoiceDesign/CustomVoice 模式)
+
+    // --- 音色克隆（Base 模型，预留）---
     std::string reference_text;      // 参考文本
     std::string reference_audio_path;// 参考音频路径
 
+    bool non_streaming_mode = true;  // 非流式模式
     bool debug = false;              // 调试输出
 };
 
@@ -146,12 +152,14 @@ private:
     int rope_head_dim_ = 64;    // RoPE 头维度
     float rope_theta_ = 1000000.0f;  // RoPE 基频
 
-    int num_codebooks_ = 4;       // 音频 codebook 层数
-    int codec_vocab_size_ = 4096; // codec 词表大小
-    int sample_rate_ = 24000;     // 输出采样率
-    int mel_dim_ = 128;           // mel 维度（仅 TTS_FLOW）
+    int num_codebooks_ = 8;        // 音频 codebook 层数 (Qwen3-TTS-12Hz 默认 8)
+    int codec_vocab_size_ = 32768; // codec 词表大小 (Qwen3-TTS-12Hz)
+    int sample_rate_ = 24000;      // 输出采样率
+    int frame_rate_ = 12;          // 音频帧率 (12Hz)
+    int mel_dim_ = 128;            // mel 维度（仅 TTS_FLOW）
 
     int vocab_size_ = 0;          // 文本词表大小
+    std::string tts_model_type_ = "base"; // base / custom_voice / voice_design
 
     /**
      * @brief Prefill 阶段：文本编码 + 首个 token 生成

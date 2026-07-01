@@ -29,12 +29,9 @@ AudioCodec::AudioCodec(const std::string& model_path,
         if (config.contains("hop_length")) {
             codec_config_.hop_length = config["hop_length"].get<int>();
         }
-        if (config.contains("codebook_rates")) {
-            codec_config_.codebook_rates = config["codebook_rates"].get<std::vector<int>>();
-        }
-        // 若 codebook_rates 长度与 num_codebooks 不匹配，则填充默认值 1
-        if ((int)codec_config_.codebook_rates.size() != codec_config_.num_codebooks) {
-            codec_config_.codebook_rates.resize(codec_config_.num_codebooks, 1);
+        if (config.contains("frame_rate")) {
+            codec_config_.frame_rate = config["frame_rate"].get<int>();
+            codec_config_.hop_length = codec_config_.sample_rate / codec_config_.frame_rate;
         }
 
         // 构建 codec 解码网络的 param/bin 文件路径
@@ -81,15 +78,16 @@ ncnn::Mat AudioCodec::tokens_to_mat(const std::vector<std::vector<int>>& codec_t
         max_frames = std::max(max_frames, (int)cb.size());
     }
 
-    // 构建 ncnn::Mat，形状 [max_frames, num_codebooks]
-    ncnn::Mat mat(max_frames, num_codebooks);
+    // Qwen3-TTS-Tokenizer-12Hz: 构建 (T, Q) 矩阵
+    // ncnn::Mat layout: w = num_codebooks (Q), h = max_frames (T)
+    // 即 mat.row(t) = [codebook_0[t], codebook_1[t], ..., codebook_Q-1[t]]
+    ncnn::Mat mat(num_codebooks, max_frames);
     mat.fill(0.0f);
 
-    // 将每层 codebook 的 token 填入对应行
     for (int cb = 0; cb < num_codebooks; ++cb) {
-        float* row = mat.row(cb);
-        for (int i = 0; i < (int)codec_tokens[cb].size(); ++i) {
-            row[i] = static_cast<float>(codec_tokens[cb][i]);
+        for (int t = 0; t < (int)codec_tokens[cb].size(); ++t) {
+            float* row = mat.row(t);
+            row[cb] = static_cast<float>(codec_tokens[cb][t]);
         }
     }
     return mat;

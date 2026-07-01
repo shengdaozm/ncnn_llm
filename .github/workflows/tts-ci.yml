@@ -1,0 +1,95 @@
+name: tts-ci
+
+on:
+  push:
+    branches: [ main, ncnn_qwentts ]
+    paths:
+      - 'src/ncnn_llm_tts.*'
+      - 'src/flow_matching.*'
+      - 'src/utils/audio/**'
+      - 'examples/tts_main.cpp'
+      - 'tests/tts_load_test.cpp'
+      - 'export/qwen3_tts_export.py'
+      - 'xmake.lua'
+      - '.github/workflows/tts-ci.yml'
+  pull_request:
+    paths:
+      - 'src/ncnn_llm_tts.*'
+      - 'src/flow_matching.*'
+      - 'src/utils/audio/**'
+      - 'examples/tts_main.cpp'
+      - 'tests/tts_load_test.cpp'
+      - 'export/qwen3_tts_export.py'
+      - 'xmake.lua'
+      - '.github/workflows/tts-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  build-tts:
+    name: Build TTS (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup xmake
+      uses: xmake-io/github-action-setup-xmake@v1
+      with:
+        xmake-version: latest
+
+    - name: Cache xmake packages
+      uses: actions/cache@v4
+      id: xmake-cache
+      with:
+        path: ~/.xmake
+        key: xmake-tts-${{ runner.os }}-${{ hashFiles('xmake.lua') }}
+
+    - name: Configure
+      run: xmake config -y -m release
+
+    - name: Build tts_main
+      run: xmake build tts_main
+
+    - name: Build tts_load_test
+      run: xmake build tts_load_test
+
+    - name: Verify tts_main binary
+      run: |
+        BINARY=$(find build -name "tts_main" -type f | head -1)
+        if [ -z "$BINARY" ]; then
+          echo "ERROR: tts_main binary not found"
+          exit 1
+        fi
+        echo "Found: $BINARY"
+        "$BINARY" --help || true
+
+    - name: Verify tts_load_test binary
+      run: |
+        BINARY=$(find build -name "tts_load_test" -type f | head -1)
+        if [ -z "$BINARY" ]; then
+          echo "ERROR: tts_load_test binary not found"
+          exit 1
+        fi
+        echo "Found: $BINARY"
+        "$BINARY" --help || true
+
+  python-lint:
+    name: Lint Export Script
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Verify Python syntax
+      run: python -m py_compile export/qwen3_tts_export.py && echo "Syntax OK"
+
+    - name: Verify verification script syntax
+      run: python -m py_compile tests/verify_tts_export.py && echo "Syntax OK"

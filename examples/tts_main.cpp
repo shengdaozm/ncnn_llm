@@ -28,21 +28,25 @@
 #include "ncnn_llm_tts.h"
 
 int main(int argc, char** argv) {
-    // 默认参数
-    std::string model_path = "assets/qwen_tts";
+    // 默认参数 (对齐 Qwen3-TTS generate_config.json)
+    std::string model_path = "assets/qwen3_tts";
     std::string text = "Hello, this is a text to speech test.";
     std::string output_path = "tts_output.wav";
     bool use_vulkan = false;
     int num_threads = 0;
     int vulkan_device = 0;
-    int max_new_tokens = 4096;
-    float temperature = 0.3f;
-    float top_p = 0.8f;
+    int max_new_tokens = 2048;
+    float temperature = 0.9f;
+    float top_p = 1.0f;
     int top_k = 50;
-    float repetition_penalty = 1.1f;
+    float repetition_penalty = 1.05f;
     int do_sample = 1;
     int flow_steps = 10;
     bool debug = false;
+    std::string language = "Auto";
+    std::string speaker;
+    std::string instruct;
+    bool non_streaming_mode = true;
 
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -74,6 +78,14 @@ int main(int argc, char** argv) {
             temperature = 0.0f;
         } else if (arg == "--flow-steps" && i + 1 < argc) {
             flow_steps = atoi(argv[++i]);
+        } else if (arg == "--language" && i + 1 < argc) {
+            language = argv[++i];
+        } else if (arg == "--speaker" && i + 1 < argc) {
+            speaker = argv[++i];
+        } else if (arg == "--instruct" && i + 1 < argc) {
+            instruct = argv[++i];
+        } else if (arg == "--streaming-mode") {
+            non_streaming_mode = false;
         } else if (arg == "--debug") {
             debug = true;
         } else {
@@ -103,6 +115,10 @@ int main(int argc, char** argv) {
     cfg.do_sample = do_sample;
     cfg.num_threads = num_threads > 0 ? num_threads : 4;
     cfg.flow_steps = flow_steps;
+    cfg.language = language;
+    cfg.speaker = speaker;
+    cfg.instruct = instruct;
+    cfg.non_streaming_mode = non_streaming_mode;
     cfg.debug = debug;
 
     // 执行语音合成

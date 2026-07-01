@@ -1,0 +1,14 @@
+CompileFlags:
+  Add: [-std=c++20, -Isrc, -Wall, -Wno-unused-parameter, -Wno-unused-variable]
+  Remove: [-Werror, -fvisibility=hidden, -fvisibility-inlines-hidden]
+
+Diagnostics:
+  Suppress: [unused-includes]
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+
+Hover:
+  ShowAKA: Yes
