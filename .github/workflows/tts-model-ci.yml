@@ -56,6 +56,11 @@ jobs:
         path: ~/.cache/pip
         key: pip-tts-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
 
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq sox libsox-dev || true
+
     - name: Install Python Dependencies
       run: |
         pip install --upgrade pip

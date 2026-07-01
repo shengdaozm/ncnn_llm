@@ -242,13 +242,28 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     print(f"{'='*60}")
 
     # Register qwen3_tts model type (requires qwen-tts package)
+    # The qwen_tts package does NOT auto-register on import;
+    # we must explicitly call AutoConfig.register / AutoModel.register.
     try:
-        import qwen_tts  # noqa: F401
-        print("  qwen_tts package imported, model types registered")
+        from qwen_tts.core import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+        print("  qwen3_tts model type registered via qwen_tts.core")
     except ImportError:
-        print("  WARNING: qwen-tts package not found, trying manual registration")
-        # Fallback: try to register via transformers trust_remote_code
-        pass
+        print("  WARNING: qwen_tts.core not found, trying trust_remote_code fallback")
+        try:
+            import qwen_tts  # noqa: F401
+            from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+            # Trigger registration by calling the class method that does it
+            # Qwen3TTSModel.from_pretrained registers, but we don't want to load yet
+            # Instead, manually register using the classes from the package
+            from qwen_tts.core.models import Qwen3TTSConfig as _Cfg, Qwen3TTSForConditionalGeneration as _Mdl
+            AutoConfig.register("qwen3_tts", _Cfg)
+            AutoModel.register(_Cfg, _Mdl)
+            print("  qwen3_tts model type registered via qwen_tts.core.models")
+        except Exception as e:
+            print(f"  WARNING: Could not register qwen3_tts: {e}")
+            print("  Will rely on trust_remote_code=True")
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -330,9 +345,17 @@ def export_tokenizer_decoder(model_id: str, out_dir: str, device: Optional[str] 
 
     # Register qwen3_tts_tokenizer model types
     try:
-        import qwen_tts  # noqa: F401
+        from qwen_tts.core import (
+            Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model,
+            Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model,
+        )
+        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
+        AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
+        AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+        print("  qwen3_tts_tokenizer model types registered")
     except ImportError:
-        pass
+        print("  WARNING: qwen_tts.core not found, relying on trust_remote_code")
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32,
