@@ -352,7 +352,7 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         ex.input("in3", last_sin_cache);
 
         for (int i = 0; i < attn_cnt; i++) {
-            char name_k_in[16], name_v_in[16];
+            char name_k_in[32], name_v_in[32];
             std::snprintf(name_k_in, sizeof(name_k_in), "cache_k%d", i);
             std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
             ex.input(name_k_in, kv_cache[i].first);
@@ -360,13 +360,13 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         }
 
         for (int i = 0; i < sconv_cnt; i++) {
-            char name_in[16];
+            char name_in[32];
             std::snprintf(name_in, sizeof(name_in), "cache_conv%d", i);
             ex.input(name_in, sconv_cache[i]);
         }
 
         for (int i = 0; i < gdr_cnt; i++) {
-            char name_in[16];
+            char name_in[32];
             std::snprintf(name_in, sizeof(name_in), "cache_gdr%d", i);
             ex.input(name_in, gdr_cache[i]);
         }

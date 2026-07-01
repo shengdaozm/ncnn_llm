@@ -237,7 +237,7 @@ private:
         ex.input("in2", attention_mask);
 
         for (int i = 0; i < kNumDecoderLayers; ++i) {
-            char name_k_in[16], name_v_in[16];
+            char name_k_in[32], name_v_in[32];
             std::snprintf(name_k_in, sizeof(name_k_in), "cache_k%d", i);
             std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
             ex.input(name_k_in, old_kv_cache[i].first);

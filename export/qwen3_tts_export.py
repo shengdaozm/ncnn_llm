@@ -292,9 +292,13 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     else:
         # Fallback: standard HF model structure
         print("  Using standard model structure")
-        base_model = model.model if hasattr(model, 'model') else model
-        embed = base_model.embed_tokens if hasattr(base_model, 'embed_tokens') else model.embed_tokens
-        lm_head = model.lm_head if hasattr(model, 'lm_head') else base_model.lm_head
+        base_model = getattr(model, 'model', model)
+        embed = getattr(base_model, 'embed_tokens', None) or getattr(model, 'embed_tokens', None)
+        if embed is None:
+            raise AttributeError("Cannot find embedding layer in model")
+        lm_head = getattr(model, 'lm_head', None) or getattr(base_model, 'lm_head', None)
+        if lm_head is None:
+            raise AttributeError("Cannot find lm_head in model")
         decoder_model = base_model if hasattr(base_model, 'layers') else model
 
     # Get config parameters from talker config if available
