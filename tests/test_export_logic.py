@@ -31,10 +31,23 @@ class FakeTalkerModel(nn.Module):
         self.norm = nn.LayerNorm(1024)
 
 
+class FakeAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(1024, 2048, bias=False)
+        self.k_proj = nn.Linear(1024, 1024, bias=False)
+        self.v_proj = nn.Linear(1024, 1024, bias=False)
+        self.o_proj = nn.Linear(2048, 1024, bias=False)
+        self.scaling = 128 ** -0.5
+        self.head_dim = 128
+
+
 class FakeDecoderLayer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(1024, 16, batch_first=True)
+        self.input_layernorm = nn.LayerNorm(1024)
+        self.self_attn = FakeAttention()
+        self.post_attention_layernorm = nn.LayerNorm(1024)
         self.mlp = nn.Linear(1024, 1024)
 
 
@@ -120,8 +133,33 @@ def test_talker_config():
     print(f"  head_dim: {talker_config.head_dim}")
 
 
+def test_decoder_layer_ts():
+    """测试 DecoderLayerTS wrapper 能正确提取子模块"""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'export'))
+    from qwen3_tts_export import DecoderLayerTS
+
+    layer = FakeDecoderLayer()
+    wrapped = DecoderLayerTS(layer, num_kv_heads=8, num_heads=16, head_dim=128)
+
+    assert hasattr(wrapped, 'input_layernorm')
+    assert hasattr(wrapped, 'q_proj')
+    assert hasattr(wrapped, 'k_proj')
+    assert hasattr(wrapped, 'v_proj')
+    assert hasattr(wrapped, 'o_proj')
+    assert hasattr(wrapped, 'mlp')
+    assert wrapped.num_kv_heads == 8
+    assert wrapped.num_heads == 16
+    assert wrapped.head_dim == 128
+    assert wrapped.num_key_value_groups == 2
+
+    print("\nPASS: DecoderLayerTS wrapper construction")
+    print(f"  num_kv_heads: {wrapped.num_kv_heads}, num_heads: {wrapped.num_heads}")
+    print(f"  head_dim: {wrapped.head_dim}, num_key_value_groups: {wrapped.num_key_value_groups}")
+
+
 if __name__ == "__main__":
     test_model_access()
     test_fallback_access()
     test_talker_config()
+    test_decoder_layer_ts()
     print("\n=== All tests passed ===")

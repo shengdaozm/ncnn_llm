@@ -236,40 +236,42 @@ pnnx lm_head.pt inputshape=[1,1,1024]f32 ncnnparam=lm_head.ncnn.param ncnnbin=lm
 直接用 `torch.jit.trace` 跟踪整个 `Qwen3TTSTalkerModel.forward()` 会失败：
 1. `DynamicCache` 对象无法被 trace（`Only tensors and tuples of tensors are supported`）
 2. 模型内部有条件分支（`if position_ids.ndim == 3`），trace 时会报 `unordered_map::at: key not found`
+3. `DecoderLayer.forward()` 只返回 `hidden_states`，KV cache 通过 `DynamicCache` 内部管理，无法通过 `out[1]` 获取
 
 #### 解决方案
 
-绕过模型的高层 forward，直接调用内部子模块（layers, norm, rotary_emb），手动构建前向传播：
+完全绕过 `DecoderLayer.forward()`，直接调用子模块，手动实现 attention + KV cache：
 
 ```python
-class DecoderTS(nn.Module):
-    def __init__(self, model: nn.Module):
+class DecoderLayerTS(nn.Module):
+    def __init__(self, layer, num_kv_heads, num_heads, head_dim):
         super().__init__()
-        self.layers = model.layers
-        self.norm = model.norm
-        self.rotary_emb = model.rotary_emb
+        self.input_layernorm = layer.input_layernorm
+        self.q_proj = layer.self_attn.q_proj
+        self.k_proj = layer.self_attn.k_proj
+        self.v_proj = layer.self_attn.v_proj
+        self.o_proj = layer.self_attn.o_proj
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.mlp = layer.mlp
+        # ...
 
-    def forward(self, inputs_embeds, position_ids):
-        # 计算 RoPE 位置编码
-        cos, sin = self.rotary_emb(inputs_embeds, position_ids)
-        position_embeddings = (cos, sin)
+    def forward(self, hidden_states, attention_mask, cos_cache, sin_cache, cache_k, cache_v):
+        # 手动 QKV 投影 + RoPE + KV cache concat + eager attention
+        ...
+        key_states = torch.cat([cache_k, key_states], dim=2)   # KV cache 拼接
+        value_states = torch.cat([cache_v, value_states], dim=2)
+        new_k = key_states
+        new_v = value_states
+        ...
+        return hidden_states, new_k, new_v
+```
 
-        # 逐层前向
-        hidden = inputs_embeds
-        for layer in self.layers:
-            out = layer(
-                hidden_states=hidden,
-                attention_mask=None,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )
-            hidden = out[0]
+KV cache 以显式 tensor 输入/输出，对齐 C++ 端 `llm_run_decoder_with_kv` 接口：
+- Inputs: `in0`=embeds, `in1`=mask, `in2`=cos, `in3`=sin, `cache_k{i}`, `cache_v{i}`
+- Outputs: `out0`=hidden, `out_cache_k{i}`, `out_cache_v{i}`
 
-        hidden = self.norm(hidden)
-        return hidden
+导出时使用非空 cache（`past_len=4`）trace，确保 `torch.cat` 分支被固化。
+C++ prefill 时传空 `ncnn::Mat`，Concat 层自动处理零维度拼接。
 ```
 
 #### mRoPE 的 position_ids 形状
@@ -293,7 +295,10 @@ sin shape: (3, 1, 8, 128)
 #### pnnx 命令
 
 ```bash
-pnnx decoder.pt inputshape=[1,8,1024]f32,[3,1,8]i64 ncnnparam=decoder.ncnn.param ncnnbin=decoder.ncnn.bin fp16=0 optlevel=2 device=cpu
+# 导出时使用非空 cache (past_len=4) 确保 torch.cat 分支被 trace
+# 输入: embeds[1,8,1024]f32, mask[8,12]f32, cos[8,128]f32, sin[8,128]f32,
+#       cache_k0[8,4,128]f32, cache_v0[8,4,128]f32, ... (28 层 × 2)
+pnnx decoder.pt inputshape=[1,8,1024]f32,[8,12]f32,[8,128]f32,[8,128]f32,[8,4,128]f32,[8,4,128]f32,... ncnnparam=decoder.ncnn.param ncnnbin=decoder.ncnn.bin fp16=0 optlevel=2 device=cpu
 ```
 
 **结果:** 成功，95KB param + 1.6GB bin
@@ -538,9 +543,10 @@ python export/qwen3_tts_export.py \
 | 3 | `Qwen3TTSForConditionalGeneration has no attribute embed_tokens` | 非标准 HF 结构 | 使用 `model.talker.model.text_embedding` |
 | 4 | `lm_head not found` | 实际输出头叫 `codec_head` | 使用 `model.talker.codec_head` |
 | 5 | `vocab_size: 3072` (不是 151936) | 这是 codec 词表 | 文本词表在 tokenizer 中，codec 词表在 talker_config 中 |
-| 6 | decoder trace: `DynamicCache not supported` | torch.jit.trace 不支持非 tensor 返回 | 绕过高层 forward，直接调用 layers |
-| 7 | decoder trace: `unordered_map::at: key not found` | 条件分支 `if position_ids.ndim == 3` | 同上，直接调用内部子模块 |
-| 8 | decoder trace: `too many indices for tensor of dimension 2` | mRoPE 需要 3D position_ids | 使用 `(3, batch, seq)` 形状 |
+| 6 | decoder trace: `DynamicCache not supported` | torch.jit.trace 不支持非 tensor 返回 | 绕过 `DecoderLayer.forward()`，直接调用子模块，手动实现 attention + KV cache |
+| 7 | decoder trace: `unordered_map::at: key not found` | 条件分支 `if position_ids.ndim == 3` | 同上，不传 position_ids，直接传 cos/sin |
+| 8 | decoder 无 KV cache 输入/输出 | `use_cache=False` 绕过 DynamicCache | 手动 `torch.cat([cache_k, new_k])` 管理显式 tensor cache |
+| 9 | C++ prefill 传空 cache 时 ncnn 报错 | cache 是 `torch.cat` 操作数，必须输入 | C++ 端传空 `ncnn::Mat`，Concat 层处理零维度 |
 | 9 | tokenizer trace: `unordered_map::at: key not found` | vmap 用于 causal mask 创建 | 改用 ONNX dynamo 导出 |
 | 10 | tokenizer ONNX: `External file .onnx.data not found` | dynamo 导出使用外部数据 | 用 onnx 库重新内联保存 |
 | 11 | tokenizer: `Expected 16 layer of codes, got 8` | num_quantizers 默认值错误 | 从 `decoder_config.num_quantizers` 读取 (16) |
@@ -594,7 +600,7 @@ CI 中可能的问题：
 
 ## 12. 后续工作
 
-1. **C++ 推理适配**: 当前 C++ 代码的 decoder 调用接口需要适配新的 ncnn 模型（position_ids 3D、无 KV cache 输出等）
+1. ~~**C++ 推理适配**~~: 已完成 — decoder 支持 KV cache 输入/输出，`llm_run_decoder_with_kv` 已适配
 2. **精度验证**: 对比 PyTorch 原版和 ncnn 版的输出是否一致
 3. **多码本生成逻辑**: LLM 生成的 codec token 序列如何映射到 `(batch, 16, T)` 矩阵
 4. **流式生成**: Dual-Track hybrid streaming 架构的 C++ 实现

@@ -1,6 +1,52 @@
 # 代码修改笔记: Qwen3-TTS 适配
 
-## 修改时间: 2026-07-01
+## 修改时间: 2026-07-02 (KV cache 支持)
+
+## 0. KV cache 导出修复 (2026-07-02)
+
+### 问题
+
+旧版 `DecoderTS` 传 `past_key_values=None, use_cache=False` 绕过 `DynamicCache`，
+导致导出的 ncnn decoder 网络没有 KV cache 输入/输出，C++ 端无法进行自回归推理。
+
+### 根因
+
+Qwen2/3 的 `DecoderLayer.forward()` 使用 `DynamicCache`（mutable 对象）管理 KV cache：
+- `past_key_values.update(key_states, value_states)` 内部拼接并返回完整 KV
+- `torch.jit.trace` 无法序列化非 tensor 对象
+- layer 的返回值只有 `hidden_states`（一个 tensor），不包含 cache
+
+### 解决方案
+
+不再调用 `DecoderLayer.forward()`，改为直接调用子模块并手动实现完整的 attention + KV cache：
+
+1. **`DecoderLayerTS`**: 直接使用 `input_layernorm` / `q_proj` / `k_proj` / `v_proj` / `o_proj` /
+   `post_attention_layernorm` / `mlp`，手动完成：
+   - QKV 投影 + reshape
+   - RoPE (`_rotate_half` + `_apply_rotary_pos_emb`，自包含实现)
+   - `torch.cat([cache_k, key_states])` 拼接 KV cache
+   - `_repeat_kv` GQA 展开
+   - Eager attention (matmul + softmax + matmul)
+   - 残差连接 + MLP
+
+2. **`DecoderTS`**: 管理 28 层 KV cache 传递，接口对齐 C++ 端 `llm_run_decoder_with_kv`：
+   - Inputs: `in0`=embeds, `in1`=mask, `in2`=cos, `in3`=sin, `cache_k{i}`, `cache_v{i}`
+   - Outputs: `out0`=hidden, `out_cache_k{i}`, `out_cache_v{i}`
+
+3. **导出时**使用非空 cache tensor（`past_len=4`）trace，确保 `torch.cat` 分支被固化。
+   C++ 端 prefill 时传入空 `ncnn::Mat`，Concat 层自动处理零维度拼接。
+
+4. **删除** `export/qwen_tts_export.py`（Qwen2.5-TTS 导出脚本，已废弃）
+
+5. **`src/ncnn_text_runtime.cpp`**: prefill 时也传入 cache blob（空 `ncnn::Mat`），
+   因为新网络中 cache 是 `torch.cat` 的操作数，不输入会导致 ncnn 报错。
+
+6. **`tests/test_export_logic.py`**: 更新 `FakeDecoderLayer` 结构对齐新 wrapper，
+   新增 `test_decoder_layer_ts` 测试。
+
+---
+
+## 修改时间: 2026-07-01 (初始适配)
 
 ## 1. 导出脚本 (`export/qwen3_tts_export.py`)
 

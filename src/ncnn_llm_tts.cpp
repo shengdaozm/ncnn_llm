@@ -256,6 +256,16 @@ ncnn::Mat ncnn_llm_tts::build_causal_mask(int seq_len) const {
 }
 
 /**
+ * @brief 构建带 KV cache 的注意力掩码
+ *
+ * Prefill: mask is (seq_len, seq_len) causal matrix
+ * Decode:  mask is (1, past_len + 1) all zeros (single token sees all history)
+ *
+ * When KV cache is present, total key length = past_len + seq_len.
+ * For prefill with empty cache, past_len=0, so mask is (seq_len, seq_len).
+ */
+
+/**
  * @brief Prefill 阶段：文本编码 + 首 token 生成
  *
  * 流程：

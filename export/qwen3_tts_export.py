@@ -64,39 +64,131 @@ class LmHeadTS(nn.Module):
         return self.lm_head(hidden_states)
 
 
-class DecoderTS(nn.Module):
-    """Wrapper for the TalkerModel decoder.
-    
-    Qwen3-TTS talker model has complex control flow (position_ids.ndim checks)
-    that breaks torch.jit.trace. We bypass this by calling the internal
-    layers directly, which gives a clean traceable graph.
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
+                           cos: torch.Tensor, sin: torch.Tensor) -> tuple:
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+
+class DecoderLayerTS(nn.Module):
+    """Single decoder layer wrapper with explicit KV cache tensors.
+
+    Bypasses DynamicCache by manually managing KV cache as plain tensors.
+    Calls the layer's sub-modules (layernorm, q/k/v/o projections, mlp)
+    directly and implements attention + KV cache concatenation inline,
+    so torch.jit.trace sees only plain tensor operations.
+
+    This avoids:
+      - DynamicCache (non-tensor object, untraceable)
+      - Conditional branching on position_ids.ndim
+      - FlashAttention dispatch
     """
-    def __init__(self, model: nn.Module):
+    def __init__(self, layer: nn.Module, num_kv_heads: int, num_heads: int, head_dim: int):
         super().__init__()
-        self.layers = model.layers
+        self.input_layernorm = layer.input_layernorm
+        self.q_proj = layer.self_attn.q_proj
+        self.k_proj = layer.self_attn.k_proj
+        self.v_proj = layer.self_attn.v_proj
+        self.o_proj = layer.self_attn.o_proj
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.mlp = layer.mlp
+        self.num_kv_heads = num_kv_heads
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scaling = layer.self_attn.scaling if hasattr(layer.self_attn, 'scaling') else (head_dim ** -0.5)
+        self.num_key_value_groups = num_heads // num_kv_heads
+
+    def forward(self, hidden_states, attention_mask,
+                cos_cache, sin_cache,
+                cache_k: torch.Tensor, cache_v: torch.Tensor):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        batch = hidden_states.size(0)
+        seq_len = hidden_states.size(1)
+
+        query_states = self.q_proj(hidden_states).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos_cache, sin_cache)
+
+        key_states = torch.cat([cache_k, key_states], dim=2)
+        value_states = torch.cat([cache_v, value_states], dim=2)
+        new_k = key_states
+        new_v = value_states
+
+        key_states = _repeat_kv(key_states, self.num_key_value_groups)
+        value_states = _repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, new_k, new_v
+
+
+class DecoderTS(nn.Module):
+    """Wrapper for the TalkerModel decoder with explicit KV cache.
+
+    Bypasses DynamicCache and complex control flow by calling sub-modules
+    directly with explicit KV cache tensors.
+
+    Interface (aligned with C++ ncnn_text_runtime llm_run_decoder_with_kv):
+      Inputs:  in0=embeds, in1=mask, in2=cos, in3=sin, cache_k{i}, cache_v{i}
+      Outputs: out0=hidden, out_cache_k{i}, out_cache_v{i}
+
+    For prefill: pass zero-length cache tensors (shape [num_kv_heads, 0, head_dim]).
+    For decode:  pass previous output cache tensors.
+    """
+    def __init__(self, model: nn.Module, num_layers: int, num_kv_heads: int, num_heads: int, head_dim: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [DecoderLayerTS(model.layers[i], num_kv_heads, num_heads, head_dim) for i in range(num_layers)]
+        )
         self.norm = model.norm
-        self.rotary_emb = model.rotary_emb
 
-    def forward(self, inputs_embeds, position_ids):
-        # Compute position embeddings once
-        cos, sin = self.rotary_emb(inputs_embeds, position_ids)
-        position_embeddings = (cos, sin)
-
+    def forward(self, inputs_embeds, mask, cos_cache, sin_cache, *caches):
         hidden = inputs_embeds
-        for layer in self.layers:
-            out = layer(
-                hidden_states=hidden,
-                attention_mask=None,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-                cache_position=None,
-                position_embeddings=position_embeddings,
-            )
-            hidden = out[0]
+        new_ks = []
+        new_vs = []
+        for i, layer in enumerate(self.layers):
+            ck = caches[i * 2]
+            cv = caches[i * 2 + 1]
+            hidden, nk, nv = layer(hidden, mask, cos_cache, sin_cache, ck, cv)
+            new_ks.append(nk)
+            new_vs.append(nv)
 
         hidden = self.norm(hidden)
-        return hidden
+        return (hidden, *new_ks, *new_vs)
 
 
 class TokenizerDecoderTS(nn.Module):
@@ -397,15 +489,27 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
 
     # Export decoder
     print("\nExporting decoder (this may take a while)...")
-    decoder_ts = DecoderTS(decoder_model)
+    decoder_ts = DecoderTS(decoder_model, num_layers, num_kv_heads, num_heads, head_dim)
 
     seq_len = 8
+    past_len = 4  # non-zero so use_cache=True path is traced
     ex_embed = torch.randn(1, seq_len, hidden_size, device=device)
-    # Qwen3-TTS uses mRoPE with 3D position_ids: (3, bs, seq)
-    ex_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
+    ex_mask = torch.zeros(seq_len, seq_len + past_len, device=device)
+    for i in range(seq_len):
+        for j in range(i + 1, seq_len + past_len):
+            ex_mask[i][j] = -1e38
+
+    ex_cos = torch.randn(seq_len, head_dim, device=device)
+    ex_sin = torch.randn(seq_len, head_dim, device=device)
+
+    # Non-empty KV cache: [num_kv_heads, past_len, head_dim]
+    caches = []
+    for _ in range(num_layers):
+        caches.append(torch.randn(num_kv_heads, past_len, head_dim, device=device))
+        caches.append(torch.randn(num_kv_heads, past_len, head_dim, device=device))
 
     try:
-        export_to_ncnn(decoder_ts, [ex_embed, ex_position_ids],
+        export_to_ncnn(decoder_ts, [ex_embed, ex_mask, ex_cos, ex_sin] + caches,
                        out_dir, "decoder", device)
     except Exception as e:
         print(f"  Decoder export failed: {e}")

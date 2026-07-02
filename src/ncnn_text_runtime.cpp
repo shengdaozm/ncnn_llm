@@ -46,13 +46,17 @@ ncnn::Mat llm_run_decoder_with_kv(ncnn::Net& decoder_net,
     ex.input("in2", cos_cache);
     ex.input("in3", sin_cache);
 
-    if (!is_prefill) {
-        for (int i = 0; i < attn_cnt; i++) {
-            char name_k_in[32], name_v_in[32];
-            std::snprintf(name_k_in, sizeof(name_k_in), "cache_k%d", i);
-            std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
+    for (int i = 0; i < attn_cnt; i++) {
+        char name_k_in[32], name_v_in[32];
+        std::snprintf(name_k_in, sizeof(name_k_in), "cache_k%d", i);
+        std::snprintf(name_v_in, sizeof(name_v_in), "cache_v%d", i);
+        if (!is_prefill) {
             ex.input(name_k_in, kv_cache[i].first);
             ex.input(name_v_in, kv_cache[i].second);
+        } else {
+            ncnn::Mat empty_k, empty_v;
+            ex.input(name_k_in, empty_k);
+            ex.input(name_v_in, empty_v);
         }
     }
 

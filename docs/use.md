@@ -274,7 +274,7 @@ ncnn_llm/
 │   └── nllb_main.cpp       # 翻译示例
 ├── export/                 # 导出脚本
 │   ├── nllb_export.py      # NLLB 导出
-│   └── qwen_tts_export.py  # Qwen2.5-TTS 导出
+│   └── qwen3_tts_export.py # Qwen3-TTS 导出
 ├── src/                    # 核心运行时
 │   ├── ncnn_llm_gpt.*      # LLM / VLM 运行时
 │   ├── ncnn_llm_ocr.*      # OCR 图像 prefill + 共享解码
