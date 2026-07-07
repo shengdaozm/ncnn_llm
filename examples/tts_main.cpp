@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
     std::string language = "Auto";
     std::string speaker;
     std::string instruct;
+    std::string ref_audio_path;
+    std::string ref_text;
     bool non_streaming_mode = true;
 
     // 解析命令行参数
@@ -84,12 +86,16 @@ int main(int argc, char** argv) {
             speaker = argv[++i];
         } else if (arg == "--instruct" && i + 1 < argc) {
             instruct = argv[++i];
+        } else if (arg == "--ref-audio" && i + 1 < argc) {
+            ref_audio_path = argv[++i];
+        } else if (arg == "--ref-text" && i + 1 < argc) {
+            ref_text = argv[++i];
         } else if (arg == "--streaming-mode") {
             non_streaming_mode = false;
         } else if (arg == "--debug") {
             debug = true;
         } else {
-            fprintf(stderr, "Usage: %s --model <model_path> --text <text> [--output <wav_path>] [--vulkan] [--threads N] [--max-tokens N] [--temperature F] [--top-p F] [--top-k N] [--repetition-penalty F] [--greedy] [--flow-steps N] [--debug]\n", argv[0]);
+            fprintf(stderr, "Usage: %s --model <model_path> --text <text> [--output <wav_path>] [--vulkan] [--threads N] [--max-tokens N] [--temperature F] [--top-p F] [--top-k N] [--repetition-penalty F] [--greedy] [--flow-steps N] [--ref-audio <wav>] [--ref-text <text>] [--debug]\n", argv[0]);
             return 1;
         }
     }
@@ -118,6 +124,8 @@ int main(int argc, char** argv) {
     cfg.language = language;
     cfg.speaker = speaker;
     cfg.instruct = instruct;
+    cfg.reference_audio_path = ref_audio_path;
+    cfg.reference_text = ref_text;
     cfg.non_streaming_mode = non_streaming_mode;
     cfg.debug = debug;
 

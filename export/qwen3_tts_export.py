@@ -5,17 +5,22 @@ Qwen3-TTS Export to ncnn
 
 Exports the following sub-networks:
   From Qwen3-TTS LLM model (e.g. Qwen/Qwen3-TTS-12Hz-0.6B-Base):
-    - embed.ncnn.param/bin       (token embedding)
-    - decoder.ncnn.param/bin     (transformer decoder with KV cache)
-    - lm_head.ncnn.param/bin     (lm_head / output projection)
+    - embed.ncnn.param/bin              (text token embedding)
+    - decoder.ncnn.param/bin            (talker transformer decoder, 20 layers, with KV cache)
+    - lm_head.ncnn.param/bin            (codec_head: hidden → main codebook logits, vocab=3072)
+    - text_projection.ncnn.param/bin    (text_hidden_size → hidden_size MLP)
+    - speaker_encoder.ncnn.param/bin    (ECAPA-TDNN: mel → speaker embedding, dim=1024)
+    - cp_decoder.ncnn.param/bin         (code predictor 5-layer transformer, with KV cache)
+    - cp_lm_heads.ncnn.param/bin        (31 merged lm_heads: hidden → sub-codebook logits, vocab=2048)
+    - cp_codec_embeds.ncnn.param/bin    (31 merged codec embeddings: sub-codebook token → hidden)
 
   From Qwen3-TTS-Tokenizer-12Hz (separate model):
-    - tokenizer_decoder.ncnn.param/bin  (audio codes -> PCM decoder)
+    - tokenizer_decoder.ncnn.param/bin  (audio codes → PCM decoder)
 
 Also extracts tokenizer files and generates model.json.
 
 Usage:
-  # Export LLM
+  # Full export
   python export/qwen3_tts_export.py --llm_model_id Qwen/Qwen3-TTS-12Hz-0.6B-Base \
       --tokenizer_model_id Qwen/Qwen3-TTS-Tokenizer-12Hz --out_dir assets/qwen3_tts
 
@@ -191,13 +196,168 @@ class DecoderTS(nn.Module):
         return (hidden, *new_ks, *new_vs)
 
 
+class SpeakerEncoderTS(nn.Module):
+    """Wrapper for Qwen3-TTS SpeakerEncoder (ECAPA-TDNN).
+
+    Input: log-mel spectrogram [1, T_mel, mel_dim=128]
+    Output: speaker embedding [1, enc_dim=1024]
+    """
+    def __init__(self, speaker_encoder: nn.Module):
+        super().__init__()
+        self.speaker_encoder = speaker_encoder
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        out = self.speaker_encoder(mel)
+        return out
+
+
+class TextProjectionTS(nn.Module):
+    """Wrapper for talker.text_projection (ResizeMLP).
+
+    Input: text embeddings [B, T, text_hidden_size=2048]
+    Output: projected embeddings [B, T, hidden_size=1024]
+    """
+    def __init__(self, text_projection: nn.Module):
+        super().__init__()
+        self.text_projection = text_projection
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.text_projection(x)
+
+
+class CodePredictorDecoderTS(nn.Module):
+    """Wrapper for CodePredictor 5-layer transformer decoder with explicit KV cache.
+
+    Interface (aligned with C++ runtime):
+      Inputs:  in0=embeds, in1=mask, in2=cos, in3=sin, cache_k{i}, cache_v{i}
+      Outputs: out0=hidden, out_cache_k{i}, out_cache_v{i}
+    """
+    def __init__(self, cp_model: nn.Module, num_layers: int, num_kv_heads: int,
+                 num_heads: int, head_dim: int):
+        super().__init__()
+        self.cp_model = cp_model
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_key_value_groups = num_heads // num_kv_heads
+
+    def forward(self, inputs_embeds, mask, cos_cache, sin_cache, *caches):
+        hidden = inputs_embeds
+        new_ks = []
+        new_vs = []
+        for i in range(self.num_layers):
+            ck = caches[i * 2] if len(caches) > 0 else None
+            cv = caches[i * 2 + 1] if len(caches) > 0 else None
+            hidden, nk, nv = self._forward_layer(i, hidden, mask, cos_cache, sin_cache, ck, cv)
+            new_ks.append(nk)
+            new_vs.append(nv)
+        hidden = self.cp_model.norm(hidden)
+        return (hidden, *new_ks, *new_vs)
+
+    def _forward_layer(self, idx, hidden, mask, cos, sin, cache_k, cache_v):
+        layer = self.cp_model.layers[idx]
+        residual = hidden
+        hidden = layer.input_layernorm(hidden)
+
+        batch = hidden.size(0)
+        seq_len = hidden.size(1)
+
+        q = layer.self_attn.q_proj(hidden).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = layer.self_attn.k_proj(hidden).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = layer.self_attn.v_proj(hidden).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+
+        if cache_k is not None and cache_k.numel() > 0:
+            k = torch.cat([cache_k, k], dim=2)
+            v = torch.cat([cache_v, v], dim=2)
+        new_k, new_v = k, v
+
+        k = _repeat_kv(k, self.num_key_value_groups)
+        v = _repeat_kv(v, self.num_key_value_groups)
+
+        scaling = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(2, 3)) * scaling
+        if mask is not None:
+            attn = attn + mask
+        attn = nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        out = layer.self_attn.o_proj(out)
+
+        hidden = residual + out
+        residual = hidden
+        hidden = layer.post_attention_layernorm(hidden)
+        hidden = layer.mlp(hidden)
+        return hidden + residual, new_k, new_v
+
+
+class CodePredictorLmHeadsTS(nn.Module):
+    """Merged 31 lm_heads for CodePredictor.
+
+    Stacks 31 Linear(1024, 2048) into a single [1024, 31, 2048] weight tensor.
+    Input: hidden [B, T, 1024], step_index (int)
+    Output: logits [B, T, 2048] for the given step
+
+    Since ncnn doesn't support dynamic index selection, we export all 31 heads
+    as a single batched matmul and let C++ select the appropriate slice.
+    """
+    def __init__(self, lm_heads: nn.ModuleList, num_heads: int = 31):
+        super().__init__()
+        self.num_heads = num_heads
+        weights = []
+        for i in range(num_heads):
+            w = lm_heads[i].weight.data  # [2048, 1024]
+            weights.append(w)
+        self.weight = nn.Parameter(torch.stack(weights, dim=0))  # [31, 2048, 1024]
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        # hidden: [B, T, 1024]
+        # output: [31, B, T, 2048] — C++ selects the right step
+        # For export simplicity, output all 31 at once
+        B, T, D = hidden.shape
+        # [31, 2048, 1024] x [B*T, 1024, 1] → [31, 2048, B*T] → [31, B, T, 2048]
+        hidden_flat = hidden.reshape(B * T, D, 1)
+        out = torch.matmul(self.weight, hidden_flat)  # [31, 2048, B*T]
+        out = out.permute(0, 2, 1).reshape(self.num_heads, B, T, -1)
+        return out
+
+
+class CodePredictorCodecEmbedsTS(nn.Module):
+    """Merged 31 codec embeddings for CodePredictor.
+
+    Stacks 31 Embedding(2048, 1024) into a single weight tensor.
+    Input: token_ids [B, T] (long), step_index (int)
+    Output: embeddings [B, T, 1024]
+
+    Exported as a single embedding lookup; C++ handles step selection.
+    """
+    def __init__(self, codec_embeddings: nn.ModuleList, num_heads: int = 31):
+        super().__init__()
+        self.num_heads = num_heads
+        weights = []
+        for i in range(num_heads):
+            w = codec_embeddings[i].weight.data  # [2048, 1024]
+            weights.append(w)
+        self.weight = nn.Parameter(torch.stack(weights, dim=0))  # [31, 2048, 1024]
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # token_ids: [B, T] long
+        # output: [31, B, T, 1024]
+        B, T = token_ids.shape
+        out = torch.zeros(self.num_heads, B, T, self.weight.shape[2])
+        for i in range(self.num_heads):
+            out[i] = nn.functional.embedding(token_ids, self.weight[i])
+        return out
+
+
 class TokenizerDecoderTS(nn.Module):
     """Wrapper for Qwen3-TTS-Tokenizer-12Hz decoder.
-    
+
     Wraps the internal decoder sub-module directly to avoid control flow
     issues in model.decode() that break torch.jit.trace.
-    
-    Input: audio codes (batch, num_quantizers, T) e.g. (1, 16, 100)
+
+    Input: audio codes (batch, num_quantizers, T) e.g. (1, 32, 100)
     Output: PCM waveform (batch, 1, samples)
     """
     def __init__(self, tokenizer_model: nn.Module):
@@ -351,10 +511,14 @@ def extract_tokenizer(tokenizer, out_dir: str):
 
 
 def build_model_json(config, tokenizer, out_dir: str,
-                     num_codebooks: int = 16,
+                     num_codebooks: int = 32,
                      sample_rate: int = 24000,
-                     codec_vocab_size: int = 2048,
+                     codec_vocab_size: int = 3072,
+                     cp_vocab_size: int = 2048,
                      has_tokenizer_decoder: bool = False,
+                     has_speaker_encoder: bool = False,
+                     has_code_predictor: bool = False,
+                     has_text_projection: bool = False,
                      tts_model_type: str = "base"):
     model_json = {
         "model_type": "tts",
@@ -375,7 +539,7 @@ def build_model_json(config, tokenizer, out_dir: str,
             "additional_special_tokens": tokenizer.additional_special_tokens if hasattr(tokenizer, 'additional_special_tokens') else [],
         },
         "setting": {
-            "attn_cnt": getattr(config, 'talker_config', config).num_hidden_layers if hasattr(getattr(config, 'talker_config', config), 'num_hidden_layers') else 28,
+            "attn_cnt": getattr(config, 'talker_config', config).num_hidden_layers if hasattr(getattr(config, 'talker_config', config), 'num_hidden_layers') else 20,
             "tts_mode": "codec",
             "tts_model_type": tts_model_type,
             "rope": {
@@ -386,6 +550,7 @@ def build_model_json(config, tokenizer, out_dir: str,
             "audio": {
                 "num_codebooks": num_codebooks,
                 "codec_vocab_size": codec_vocab_size,
+                "cp_vocab_size": cp_vocab_size,
                 "sample_rate": sample_rate,
                 "frame_rate": 12,
             },
@@ -395,6 +560,28 @@ def build_model_json(config, tokenizer, out_dir: str,
     if has_tokenizer_decoder:
         model_json["params"]["tokenizer_decoder_param"] = "tokenizer_decoder.ncnn.param"
         model_json["params"]["tokenizer_decoder_bin"] = "tokenizer_decoder.ncnn.bin"
+
+    if has_speaker_encoder:
+        model_json["params"]["speaker_encoder_param"] = "speaker_encoder.ncnn.param"
+        model_json["params"]["speaker_encoder_bin"] = "speaker_encoder.ncnn.bin"
+
+    if has_code_predictor:
+        model_json["params"]["cp_decoder_param"] = "cp_decoder.ncnn.param"
+        model_json["params"]["cp_decoder_bin"] = "cp_decoder.ncnn.bin"
+        model_json["params"]["cp_lm_heads_param"] = "cp_lm_heads.ncnn.param"
+        model_json["params"]["cp_lm_heads_bin"] = "cp_lm_heads.ncnn.bin"
+        model_json["params"]["cp_codec_embeds_param"] = "cp_codec_embeds.ncnn.param"
+        model_json["params"]["cp_codec_embeds_bin"] = "cp_codec_embeds.ncnn.bin"
+        cp_config = getattr(config, 'talker_code_predictor_config', None)
+        if cp_config is not None:
+            model_json["setting"]["cp_attn_cnt"] = getattr(cp_config, 'num_hidden_layers', 5)
+            model_json["setting"]["cp_num_kv_heads"] = getattr(cp_config, 'num_key_value_heads', 8)
+            model_json["setting"]["cp_num_heads"] = getattr(cp_config, 'num_attention_heads', 16)
+            model_json["setting"]["cp_head_dim"] = getattr(cp_config, 'head_dim', 128)
+
+    if has_text_projection:
+        model_json["params"]["text_projection_param"] = "text_projection.ncnn.param"
+        model_json["params"]["text_projection_bin"] = "text_projection.ncnn.bin"
 
     json_path = os.path.join(out_dir, "model.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -487,6 +674,109 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     ex_hidden = torch.randn(1, 1, hidden_size, device=device)
     export_to_ncnn(lm_head_ts, ex_hidden, out_dir, "lm_head", device)
 
+    # Export text_projection (ResizeMLP: text_hidden_size → hidden_size)
+    has_text_projection = False
+    text_projection = getattr(talker, 'text_projection', None)
+    if text_projection is not None:
+        print("\nExporting text_projection...")
+        text_hidden_size = talker_config.text_hidden_size if hasattr(talker_config, 'text_hidden_size') else 2048
+        tp_ts = TextProjectionTS(text_projection)
+        ex_tp = torch.randn(1, 8, text_hidden_size, device=device)
+        export_to_ncnn(tp_ts, ex_tp, out_dir, "text_projection", device)
+        has_text_projection = True
+
+    # Export speaker encoder (ECAPA-TDNN: mel → speaker embedding)
+    has_speaker_encoder = False
+    speaker_encoder = getattr(model, 'speaker_encoder', None)
+    if speaker_encoder is not None:
+        print("\nExporting speaker_encoder...")
+        mel_dim = 128
+        ex_mel = torch.randn(1, 375, mel_dim, device=device)
+        se_ts = SpeakerEncoderTS(speaker_encoder)
+        try:
+            export_to_ncnn(se_ts, ex_mel, out_dir, "speaker_encoder", device)
+            has_speaker_encoder = True
+        except Exception as e:
+            print(f"  Speaker encoder export failed: {e}")
+    else:
+        print("\n  No speaker_encoder found (non-base model?), skipping.")
+
+    # Export code predictor (5-layer transformer + 31 lm_heads + 31 codec_embeddings)
+    has_code_predictor = False
+    code_predictor = getattr(talker, 'code_predictor', None)
+    if code_predictor is not None:
+        cp_model = getattr(code_predictor, 'model', code_predictor)
+        cp_config = getattr(config, 'talker_code_predictor_config', None)
+
+        cp_num_layers = 5
+        cp_num_kv_heads = 8
+        cp_num_heads = 16
+        cp_head_dim = 128
+        cp_hidden_size = 1024
+        cp_vocab_size = 2048
+        num_code_groups = 32
+
+        if cp_config is not None:
+            cp_num_layers = getattr(cp_config, 'num_hidden_layers', 5)
+            cp_num_kv_heads = getattr(cp_config, 'num_key_value_heads', 8)
+            cp_num_heads = getattr(cp_config, 'num_attention_heads', 16)
+            cp_head_dim = getattr(cp_config, 'head_dim', 128)
+            cp_hidden_size = getattr(cp_config, 'hidden_size', 1024)
+            cp_vocab_size = getattr(cp_config, 'vocab_size', 2048)
+            num_code_groups = getattr(cp_config, 'num_code_groups', 32)
+
+        num_sub_codebooks = num_code_groups - 1
+
+        # Export code predictor decoder (5-layer transformer with KV cache)
+        print(f"\nExporting code_predictor decoder ({cp_num_layers} layers)...")
+        cp_decoder_ts = CodePredictorDecoderTS(cp_model, cp_num_layers, cp_num_kv_heads, cp_num_heads, cp_head_dim)
+
+        cp_seq_len = 2
+        cp_past_len = 0
+        cp_ex_embed = torch.randn(1, cp_seq_len, cp_hidden_size, device=device)
+        cp_ex_mask = torch.zeros(cp_seq_len, cp_seq_len + cp_past_len, device=device)
+        for i in range(cp_seq_len):
+            for j in range(i + 1, cp_seq_len + cp_past_len):
+                cp_ex_mask[i][j] = -1e38
+        cp_ex_cos = torch.randn(cp_seq_len, cp_head_dim, device=device)
+        cp_ex_sin = torch.randn(cp_seq_len, cp_head_dim, device=device)
+        cp_caches = []
+        for _ in range(cp_num_layers):
+            cp_caches.append(torch.randn(cp_num_kv_heads, cp_past_len, cp_head_dim, device=device))
+            cp_caches.append(torch.randn(cp_num_kv_heads, cp_past_len, cp_head_dim, device=device))
+
+        try:
+            export_to_ncnn(cp_decoder_ts, [cp_ex_embed, cp_ex_mask, cp_ex_cos, cp_ex_sin] + cp_caches,
+                           out_dir, "cp_decoder", device)
+        except Exception as e:
+            print(f"  Code predictor decoder export failed: {e}")
+
+        # Export merged 31 lm_heads
+        print(f"\nExporting code_predictor lm_heads ({num_sub_codebooks} heads)...")
+        cp_lm_heads = getattr(code_predictor, 'lm_head', None)
+        if cp_lm_heads is not None:
+            lm_heads_ts = CodePredictorLmHeadsTS(cp_lm_heads, num_heads=num_sub_codebooks)
+            ex_cp_hidden = torch.randn(1, 1, cp_hidden_size, device=device)
+            try:
+                export_to_ncnn(lm_heads_ts, ex_cp_hidden, out_dir, "cp_lm_heads", device)
+            except Exception as e:
+                print(f"  Code predictor lm_heads export failed: {e}")
+
+        # Export merged 31 codec embeddings
+        print(f"\nExporting code_predictor codec_embeddings ({num_sub_codebooks} embeds)...")
+        cp_codec_embeds = getattr(cp_model, 'codec_embedding', None)
+        if cp_codec_embeds is not None:
+            embeds_ts = CodePredictorCodecEmbedsTS(cp_codec_embeds, num_heads=num_sub_codebooks)
+            ex_cp_ids = torch.tensor([[1, 2, 3]], dtype=torch.long, device=device)
+            try:
+                export_to_ncnn(embeds_ts, ex_cp_ids, out_dir, "cp_codec_embeds", device)
+            except Exception as e:
+                print(f"  Code predictor codec_embeddings export failed: {e}")
+
+        has_code_predictor = True
+    else:
+        print("\n  No code_predictor found, skipping.")
+
     # Export decoder
     print("\nExporting decoder (this may take a while)...")
     decoder_ts = DecoderTS(decoder_model, num_layers, num_kv_heads, num_heads, head_dim)
@@ -519,7 +809,7 @@ def export_llm(model_id: str, out_dir: str, device: Optional[str] = None):
     print("\nExtracting tokenizer...")
     extract_tokenizer(tokenizer, out_dir)
 
-    return config, tokenizer
+    return config, tokenizer, has_speaker_encoder, has_code_predictor, has_text_projection
 
 
 @torch.no_grad()
@@ -570,7 +860,7 @@ def export_tokenizer_decoder(model_id: str, out_dir: str, device: Optional[str] 
         tokenizer_ts = TokenizerDecoderTS(model)
 
         # Example input: (batch, num_quantizers, T) audio codes
-        ex_codes = torch.randint(0, codebook_size, (1, num_quantizers, 100), dtype=torch.long, device=device)
+        ex_codes = torch.randint(0, codebook_size, (1, 32, 100), dtype=torch.long, device=device)
         try:
             export_to_ncnn(tokenizer_ts, ex_codes, out_dir, "tokenizer_decoder", device)
             return True
@@ -596,26 +886,38 @@ if __name__ == "__main__":
                         help="Device: cpu or cuda")
     parser.add_argument("--skip-tokenizer", action="store_true",
                         help="Skip exporting the tokenizer decoder")
-    parser.add_argument("--num_codebooks", type=int, default=16,
-                        help="Number of audio codebooks (quantizers)")
+    parser.add_argument("--num_codebooks", type=int, default=32,
+                        help="Number of audio codebooks (num_code_groups)")
     parser.add_argument("--tts_model_type", type=str, default="base",
                         choices=["base", "custom_voice", "voice_design"],
                         help="TTS model type")
 
     args = parser.parse_args()
 
-    config, tokenizer = export_llm(args.llm_model_id, args.out_dir, args.device)
+    config, tokenizer, has_speaker_encoder, has_code_predictor, has_text_projection = \
+        export_llm(args.llm_model_id, args.out_dir, args.device)
 
     has_tokenizer_decoder = False
     if not args.skip_tokenizer:
         has_tokenizer_decoder = export_tokenizer_decoder(
             args.tokenizer_model_id, args.out_dir, args.device)
 
+    # Read actual vocab sizes from config
+    talker_config = getattr(config, 'talker_config', config)
+    codec_vocab_size = getattr(talker_config, 'vocab_size', 3072)
+    cp_config = getattr(config, 'talker_code_predictor_config', None)
+    cp_vocab_size = getattr(cp_config, 'vocab_size', 2048) if cp_config else 2048
+
     print("\nBuilding model.json...")
     build_model_json(
         config, tokenizer, args.out_dir,
         num_codebooks=args.num_codebooks,
+        codec_vocab_size=codec_vocab_size,
+        cp_vocab_size=cp_vocab_size,
         has_tokenizer_decoder=has_tokenizer_decoder,
+        has_speaker_encoder=has_speaker_encoder,
+        has_code_predictor=has_code_predictor,
+        has_text_projection=has_text_projection,
         tts_model_type=args.tts_model_type,
     )
 

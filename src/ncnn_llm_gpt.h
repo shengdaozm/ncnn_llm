@@ -51,6 +51,7 @@ public:
     KVCache kv_cache;
     int cur_token = 0;
     int position_id = 0;
+    ncnn::Mat past_hidden;  // last hidden state from talker decoder (for code predictor)
 };
 
 class ncnn_llm_gpt_base_ctx : public ncnn_llm_gpt_ctx {
@@ -64,6 +65,7 @@ public:
         }
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->past_hidden = past_hidden;
         return dst;
     }
 };
@@ -84,6 +86,7 @@ public:
         dst->gdr_cache = gdr_cache;
         dst->cur_token = cur_token;
         dst->position_id = position_id;
+        dst->past_hidden = past_hidden;
         return dst;
     }
 };

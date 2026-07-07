@@ -24,8 +24,8 @@ using nlohmann::json;
  * @brief 音频 codec 配置参数
  */
 struct CodecConfig {
-    int num_codebooks = 8;           // codebook 层数 (Qwen3-TTS-12Hz 默认 8)
-    int vocab_size = 32768;          // 每个 codebook 的词表大小
+    int num_codebooks = 32;          // codebook 层数 (Qwen3-TTS-12Hz: 1主+31子=32)
+    int vocab_size = 3072;           // 每个 codebook 的词表大小
     int sample_rate = 24000;         // 输出音频采样率
     int frame_rate = 12;             // 帧率 (12Hz)
     int hop_length = 2000;           // 每帧对应的采样点数 (24000/12=2000)
