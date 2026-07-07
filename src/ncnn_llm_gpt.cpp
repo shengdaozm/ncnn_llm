@@ -501,12 +501,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
         if (qwen_ctx) {
             for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_conv%d", i);
                 ex.input(name, qwen_ctx->sconv_cache[i]);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_gdr%d", i);
                 ex.input(name, qwen_ctx->gdr_cache[i]);
             }
@@ -573,12 +573,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
         if (qwen_ctx) {
             for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_conv%d", i);
                 ex.input(name, qwen_ctx->sconv_cache[i]);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_gdr%d", i);
                 ex.input(name, qwen_ctx->gdr_cache[i]);
             }
@@ -694,12 +694,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
         if (qwen_ctx) {
             for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_conv%d", i);
                 ex.input(name, qwen_ctx->sconv_cache[i]);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_gdr%d", i);
                 ex.input(name, qwen_ctx->gdr_cache[i]);
             }
@@ -776,12 +776,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::prefill(const std::string& input
         auto qwen_ctx = std::dynamic_pointer_cast<qwen3_5_ctx>(new_ctx);
         if (qwen_ctx) {
             for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_conv%d", i);
                 ex.input(name, qwen_ctx->sconv_cache[i]);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_gdr%d", i);
                 ex.input(name, qwen_ctx->gdr_cache[i]);
             }
@@ -929,12 +929,12 @@ std::shared_ptr<ncnn_llm_gpt_ctx> ncnn_llm_gpt::generate(const std::shared_ptr<n
             }
 
             for (int i = 0; i < sconv_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_conv%d", i);
                 ex.input(name, qwen_ctx->sconv_cache[i]);
             }
             for (int i = 0; i < gdr_cnt; ++i) {
-                char name[16];
+                char name[32];
                 std::snprintf(name, sizeof(name), "cache_gdr%d", i);
                 ex.input(name, qwen_ctx->gdr_cache[i]);
             }
