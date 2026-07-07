@@ -526,7 +526,7 @@ std::vector<std::vector<int>> ncnn_llm_tts::generate_codec_tokens(
             // We need to sum the appropriate step's embedding
             for (int i = 0; i < (int)sub_tokens.size() && i < num_sub_codebooks; ++i) {
                 ncnn::Mat sub_id_mat(1);
-                sub_id_mat.data[0] = (float)sub_tokens[i];
+                ((float*)sub_id_mat.data)[0] = (float)sub_tokens[i];
                 
                 ncnn::Extractor ex = cp_codec_embeds_net_->create_extractor();
                 ex.input("in0", sub_id_mat);
@@ -662,7 +662,7 @@ std::vector<int> ncnn_llm_tts::run_code_predictor(const ncnn::Mat& talker_hidden
     for (int step = 1; step < num_sub; ++step) {
         // Embed previous sub-codebook token using cp_codec_embedding[step-1]
         ncnn::Mat prev_id_mat(1);
-        prev_id_mat.data[0] = (float)sub_tokens.back();
+        ((float*)prev_id_mat.data)[0] = (float)sub_tokens.back();
 
         ncnn::Mat all_embeds;
         {
